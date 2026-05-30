@@ -2,6 +2,16 @@
 Cheap: tiny prompt, tiny max-tokens, free/sunk routes first. Writes results so
 go-live only trusts verified routes.
 """
+
+import os as _os
+_envf = "/home/andy/argos/.env"
+if _os.path.exists(_envf):
+    for _l in open(_envf):
+        _l = _l.strip()
+        if _l and not _l.startswith("#") and "=" in _l:
+            _k, _v = _l.split("=", 1)
+            _os.environ.setdefault(_k.strip(), _v.strip().strip(chr(34)).strip(chr(39)))
+
 import sqlite3, json, urllib.request, time, datetime, os
 
 DB = "/home/andy/argos/argos.db"

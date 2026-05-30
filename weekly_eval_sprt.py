@@ -1,3 +1,12 @@
+import os as _os
+_envf = "/home/andy/argos/.env"
+if _os.path.exists(_envf):
+    for _l in open(_envf):
+        _l = _l.strip()
+        if _l and not _l.startswith("#") and "=" in _l:
+            _k, _v = _l.split("=", 1)
+            _os.environ.setdefault(_k.strip(), _v.strip().strip(chr(34)).strip(chr(39)))
+
 #!/usr/bin/env python3
 """
 Argos weekly champion-challenger eval with Wald SPRT promotion gate.
