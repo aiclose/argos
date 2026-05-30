@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+*.db
+*.db.bak-*
+.env
+quality_predictor_history/
