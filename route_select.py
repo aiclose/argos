@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import cost as costmod  # the effective_cost module built alongside this
+import route_priors  # benchmark-seeded warm-start priors
 
 DB_PATH = "/home/andy/argos/argos.db"
 
@@ -66,24 +67,27 @@ def _quality_floor(con, task: RouteTask) -> float:
 
 
 def _predicted_success(con, route, task: RouteTask, floor: float) -> float:
-    """Use logged outcomes for this route+task_class if we have enough; else floor.
+    """Predict route success, in priority order:
+    1. Observed accept rate for this route+task_class if >= MIN_OBS labels (real data wins).
+    2. Otherwise a benchmark-seeded warm-start prior (route_priors), so routes
+       differentiate by known model capability instead of all tying at the floor.
+    3. The floor only as a last resort if no prior is available.
 
-    Deliberately simple per the research: do NOT pretend to a calibrated model
-    until labels exist. If this route has >= MIN_OBS labelled dispatches for this
-    task_class, use the observed accept rate; otherwise return the floor (neutral:
-    the route is assumed just-good-enough, so selection falls to cost).
+    As real route-spread outcomes accumulate, (1) overrides the seed. This is the
+    research's warm-start: benchmark priors now, learned rates later.
     """
     MIN_OBS = 5
     mid = route["model_id"]
-    if not mid or not task.task_class:
-        return floor
-    row = con.execute(
-        "SELECT COUNT(*) n, AVG(CASE WHEN accepted THEN 1.0 ELSE 0.0 END) rate "
-        "FROM dispatches WHERE model_used=? AND task_class=? AND accepted IS NOT NULL",
-        (mid, task.task_class)).fetchone()
-    if row and row["n"] and row["n"] >= MIN_OBS and row["rate"] is not None:
-        return float(row["rate"])
-    return floor  # not enough evidence: neutral, let cost decide
+    if mid and task.task_class:
+        row = con.execute(
+            "SELECT COUNT(*) n, AVG(CASE WHEN accepted THEN 1.0 ELSE 0.0 END) rate "
+            "FROM dispatches WHERE model_used=? AND task_class=? AND accepted IS NOT NULL",
+            (mid, task.task_class)).fetchone()
+        if row and row["n"] and row["n"] >= MIN_OBS and row["rate"] is not None:
+            return float(row["rate"])  # real data overrides the seed
+    # warm-start from benchmark prior
+    seed = route_priors.seed_prior(mid, route["tool"], task.error_sensitivity)
+    return seed if seed is not None else floor
 
 
 def select_route(task: RouteTask) -> RoutePlan:
