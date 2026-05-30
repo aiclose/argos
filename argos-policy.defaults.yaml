@@ -1,0 +1,116 @@
+# Argos routing policy (capability-first, two-level).
+# Backend selection = a capability/feasibility decision (Forge vs Janus).
+# Route selection   = an optimisation decision within the chosen backend.
+# This file is DATA. The evaluation logic lives in route_select.py; this holds
+# the predicates' wiring, the task-class map, and the scoring weights.
+#
+# Reset to defaults: cp argos-policy.defaults.yaml argos-policy.yaml
+# The loader validates this on read and falls back to defaults if malformed.
+version: 1
+
+# ---------------------------------------------------------------------------
+# BACKEND GATE (capability-first). Precedence: explicit override -> hard Forge
+# predicates -> hard Janus predicates -> ambiguous default. Forge triggers on
+# NECESSITY (hands on the keyboard); Janus is the safe default (brain + mouth).
+# ---------------------------------------------------------------------------
+backend_gate:
+  ambiguous_default: janus      # safest failure for a single-user system
+  # Any of these task properties being true forces Forge (execution authority).
+  forge_predicates:
+    - needs_file_write          # create/edit/delete files
+    - needs_command_exec        # run shell/tests/builds/migrations
+    - needs_tool_loop           # iterate act->observe->act
+    - needs_local_state         # inspect repo/logs/env/filesystem
+    - acceptance_requires_execution   # success only verifiable by running something
+  # Janus is sufficient only if ALL of these hold (and no Forge predicate fired).
+  janus_predicates_all:
+    - text_only_output
+    - single_turn_sufficient
+  # Lexical inference (fallback ONLY when caller did not set predicates).
+  # These are heuristics; every inferred decision is logged so we can see misroutes.
+  lexical_forge_verbs: [apply, edit, run, fix, patch, save, commit, deploy, migrate, install, build, test, refactor, rename, delete]
+  lexical_janus_verbs: [explain, compare, plan, draft, brainstorm, summarise, summarize, describe, suggest, review, critique, what, why, how]
+
+# ---------------------------------------------------------------------------
+# TASK-CLASS -> BACKEND HINT. Reuses the existing Astrolabe / 24-class taxonomy.
+# This is a HINT layer feeding the predicates, not a hard override: a class can
+# still be pushed the other way by an explicit caller predicate. "capable" means
+# the class typically needs execution; "sufficient" means text usually suffices.
+# ---------------------------------------------------------------------------
+task_class_backend:
+  # execution-leaning (Forge)
+  code_generation: forge
+  code_implementation: forge
+  code_boilerplate: forge
+  code_algorithmic: forge
+  debugging: forge
+  debugging_simple: forge
+  debugging_intermittent: forge
+  refactoring: forge
+  testing: forge
+  test_unit: forge
+  test_integration: forge
+  data_engineering: forge
+  devops: forge
+  # Astrolabe verbs that imply execution
+  ssh-fix: forge
+  ssh-diagnose: forge
+  file-edit-single: forge
+  file-edit-multi: forge
+  code-write-new: forge
+  code-debug: forge
+  multi-machine-orchestrate: forge
+  vault-bulk-edit: forge
+  # cognition-leaning (Janus)
+  documentation: janus
+  docs_api: janus
+  docs_explainer: janus
+  architecture_design: janus
+  analysis: janus
+  formatting: janus
+  extraction: janus
+  creative: janus
+  classification: janus
+  conversation: janus
+  security: janus           # advisory unless it also needs to touch the system
+  info-gather: janus
+  web-research: janus
+  schema-design: janus
+  brief-meta: janus
+
+# ---------------------------------------------------------------------------
+# ROUTE SCORING (within the chosen backend). Weights are SEEDS to tune against
+# real outcomes, not evidence. Filters run before scoring (unhealthy / wrong
+# backend / quota-blocked / capability-insufficient removed first).
+# ---------------------------------------------------------------------------
+scoring:
+  # Forge cares more about reliability+quota (failed loops are costly).
+  forge_weights:
+    health: 0.35
+    quota: 0.20
+    quality: 0.20
+    cost: 0.15
+    latency: 0.05
+    path_preference: 0.05
+  # Janus cares more about cost+latency (text replies, interchangeable in band).
+  janus_weights:
+    health: 0.25
+    quota: 0.10
+    quality: 0.20
+    cost: 0.25
+    latency: 0.15
+    path_preference: 0.05
+  # path_preference: nudge toward zero-marginal flat-rate-capped healthy routes.
+  # This captures the dual-homed free-path economics WITHOUT breaking the
+  # capability-first hierarchy. Promote to a hard rule later if desired.
+  path_preference_bonus:
+    flat_rate_capped: 1.0     # full bonus (OpenCode Go, ~$0 marginal within cap)
+    sunk: 0.8                 # OAuth CLIs, also ~$0 marginal
+    per_token: 0.0            # no bonus
+
+# Quality floors per error-sensitivity (used by the floor gate, unchanged).
+quality_floors:
+  low: 0.65
+  medium: 0.70
+  high: 0.85
+  critical: 0.90
