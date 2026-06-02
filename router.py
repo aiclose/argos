@@ -7,7 +7,7 @@ Listens on 0.0.0.0:3020.
 """
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Dict, Optional, List
 import yaml
 import sqlite3
 import time
@@ -118,6 +118,9 @@ class TaskRequest(BaseModel):
     domain: Optional[str] = None
     task_type: Optional[str] = None
     notes: Optional[str] = None
+    explicit_backend_override: Optional[str] = Field(None, description="Optional hard backend override: forge or janus")
+    predicates: Optional[Dict[str, bool]] = Field(None, description="Backend-gate predicates supplied by caller")
+    required_capabilities: List[str] = Field(default_factory=list, description="Capabilities required from the selected route")
 
 class RoutingDecision(BaseModel):
     decision_id: str
@@ -556,6 +559,10 @@ def route_v2(t: TaskRequest):
         tag=t.tag, task_class=t.task_class, error_sensitivity=t.error_sensitivity,
         estimated_input_tokens=t.estimated_input_tokens,
         estimated_output_tokens=t.estimated_output_tokens,
+        explicit_backend_override=t.explicit_backend_override,
+        predicates=t.predicates,
+        prompt=t.notes or "",
+        required_capabilities=tuple(t.required_capabilities or ()),
     )
     plan = _rsel.select_route(rt)
     # log to predictions with route-aware rationale
@@ -582,11 +589,26 @@ def route_v2(t: TaskRequest):
         "shadow_mode": True,
         "selected_route": plan.selected_route,
         "selected_model": plan.selected_model,
+        "backend": plan.backend,
+        "backend_reason": plan.backend_reason,
+        "gated_backend": plan.gated_backend,
+        "gate_reason": plan.gate_reason,
         "cost_mode": plan.cost_mode,
         "effective_cost_usd": plan.effective_cost,
         "quality_floor": plan.quality_floor,
         "predicted_success": plan.predicted_success,
         "cleared_floor": plan.cleared_floor,
+        "scorer_score": plan.scorer_score,
+        "scored_choice": {
+            "selected_route": plan.selected_route,
+            "selected_model": plan.selected_model,
+            "cost_mode": plan.cost_mode,
+            "effective_cost_usd": plan.effective_cost,
+            "predicted_success": plan.predicted_success,
+            "cleared_floor": plan.cleared_floor,
+            "scorer_score": plan.scorer_score,
+        } if plan.error is None else None,
+        "error": plan.error,
         "fallback_chain": plan.fallback_chain,
         "candidate_count": plan.candidate_count,
         "rationale": plan.rationale,

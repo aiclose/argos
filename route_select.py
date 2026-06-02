@@ -14,14 +14,37 @@ automatically as the predictor calibrates on accumulated accept/reject labels.
 Exposed as select_route(task) so router.py can call it from a /route-v2 endpoint.
 """
 from __future__ import annotations
+import logging
+import os
+import re
 import sqlite3, json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Mapping, Optional
+
+try:
+    import yaml
+except ModuleNotFoundError:  # keep policy loading dependency-free in minimal envs
+    yaml = None
 
 import cost as costmod  # the effective_cost module built alongside this
 import route_priors  # benchmark-seeded warm-start priors
 
 DB_PATH = "/home/andy/argos/argos.db"
+POLICY_PATH = os.path.join(os.path.dirname(__file__), "argos-policy.yaml")
+DEFAULT_POLICY_PATH = os.path.join(os.path.dirname(__file__), "argos-policy.defaults.yaml")
+BACKEND_FORGE = "forge"
+BACKEND_JANUS = "janus"
+BACKEND_GATE_REASONS = {
+    "override",
+    "forge_predicate",
+    "janus_predicate",
+    "task_class",
+    "ambiguous",
+    "lexical-inferred",
+}
+SOFT_EXEC_FLAVOURED_VERBS = {"build", "fix", "refactor", "test"}
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -31,6 +54,10 @@ class RouteTask:
     error_sensitivity: Optional[str] = None
     estimated_input_tokens: int = 4000
     estimated_output_tokens: int = 1500
+    explicit_backend_override: Optional[str] = None
+    predicates: Optional[Mapping[str, bool]] = None
+    prompt: str = ""
+    required_capabilities: tuple[str, ...] = ()
 
 
 @dataclass
@@ -45,6 +72,280 @@ class RoutePlan:
     fallback_chain: list = field(default_factory=list)
     candidate_count: int = 0
     rationale: str = ""
+    backend: Optional[str] = None
+    backend_reason: Optional[str] = None
+    scorer_score: float = 0.0
+    error: Optional[dict] = None
+
+    @property
+    def gated_backend(self) -> Optional[str]:
+        return self.backend
+
+    @property
+    def gate_reason(self) -> Optional[str]:
+        return self.backend_reason
+
+
+@dataclass(frozen=True)
+class BackendGateDecision:
+    backend: str
+    reason: str
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i]
+    return line
+
+
+def _parse_policy_scalar(value: str):
+    value = value.strip()
+    if not value:
+        return {}
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_policy_scalar(part) for part in inner.split(",")]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    return value.strip("\"'")
+
+
+def _simple_policy_load(text: str) -> dict:
+    """Small YAML subset parser for argos-policy.yaml when PyYAML is absent."""
+    root = {}
+    stack = [(-1, root)]
+    pending_key = None
+
+    for raw in text.splitlines():
+        line = _strip_yaml_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        item = line.strip()
+
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+
+        if item.startswith("- "):
+            if not isinstance(parent, list):
+                if pending_key is None:
+                    raise ValueError("list item without parent key")
+                parent_map = stack[-2][1]
+                parent_map[pending_key] = []
+                parent = parent_map[pending_key]
+                stack[-1] = (stack[-1][0], parent)
+            parent.append(_parse_policy_scalar(item[2:]))
+            continue
+
+        key, sep, value = item.partition(":")
+        if not sep:
+            raise ValueError(f"invalid policy line: {raw!r}")
+        key = key.strip()
+        parsed = _parse_policy_scalar(value)
+        parent[key] = parsed
+        pending_key = key
+        if isinstance(parsed, dict):
+            stack.append((indent, parsed))
+
+    return root
+
+
+def _read_policy(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        if yaml is not None:
+            policy = yaml.safe_load(f) or {}
+        else:
+            policy = _simple_policy_load(f.read())
+    return policy
+
+
+def _require_mapping(policy: Mapping, key: str) -> Mapping:
+    value = policy.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"policy.{key} must be a mapping")
+    return value
+
+
+def _require_string_list(mapping: Mapping, key: str) -> list[str]:
+    value = mapping.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"policy.{key} must be a list of strings")
+    return value
+
+
+def _validate_policy(policy: dict, path: str) -> None:
+    if not isinstance(policy, dict):
+        raise ValueError(f"policy must be a mapping: {path}")
+    if policy.get("version") != 1:
+        raise ValueError("policy.version must be 1")
+
+    gate = _require_mapping(policy, "backend_gate")
+    _normalise_backend(gate.get("ambiguous_default"))
+    _require_string_list(gate, "forge_predicates")
+    _require_string_list(gate, "janus_predicates_all")
+    _require_string_list(gate, "lexical_forge_verbs")
+    _require_string_list(gate, "lexical_janus_verbs")
+
+    task_map = _require_mapping(policy, "task_class_backend")
+    for task_class, backend in task_map.items():
+        if not isinstance(task_class, str):
+            raise ValueError("policy.task_class_backend keys must be strings")
+        _normalise_backend(backend)
+
+    scoring = _require_mapping(policy, "scoring")
+    for weight_key in ("forge_weights", "janus_weights"):
+        weights = scoring.get(weight_key)
+        if not isinstance(weights, Mapping):
+            raise ValueError(f"policy.scoring.{weight_key} must be a mapping")
+        for component in ("health", "quota", "quality", "cost", "latency", "path_preference"):
+            if component not in weights:
+                raise ValueError(f"policy.scoring.{weight_key}.{component} is required")
+            try:
+                float(weights[component])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"policy.scoring.{weight_key}.{component} must be numeric") from exc
+
+    path_bonus = scoring.get("path_preference_bonus")
+    if not isinstance(path_bonus, Mapping):
+        raise ValueError("policy.scoring.path_preference_bonus must be a mapping")
+    for mode, bonus in path_bonus.items():
+        if not isinstance(mode, str):
+            raise ValueError("policy.scoring.path_preference_bonus keys must be strings")
+        try:
+            float(bonus)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"policy.scoring.path_preference_bonus.{mode} must be numeric") from exc
+
+    quality_floors = _require_mapping(policy, "quality_floors")
+    for sensitivity in ("low", "medium", "high", "critical"):
+        if sensitivity not in quality_floors:
+            raise ValueError(f"policy.quality_floors.{sensitivity} is required")
+        try:
+            float(quality_floors[sensitivity])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"policy.quality_floors.{sensitivity} must be numeric") from exc
+
+
+def _load_policy(path: str = POLICY_PATH) -> dict:
+    try:
+        policy = _read_policy(path)
+        _validate_policy(policy, path)
+        return policy
+    except Exception as exc:
+        if os.path.abspath(path) == os.path.abspath(DEFAULT_POLICY_PATH):
+            raise
+        logger.warning(
+            "policy load fallback: %s malformed (%s); using %s",
+            path,
+            exc,
+            DEFAULT_POLICY_PATH,
+        )
+        fallback = _read_policy(DEFAULT_POLICY_PATH)
+        _validate_policy(fallback, DEFAULT_POLICY_PATH)
+        return fallback
+
+
+def _normalise_backend(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    backend = str(value).strip().lower()
+    if backend in {BACKEND_FORGE, BACKEND_JANUS}:
+        return backend
+    raise ValueError(f"unsupported backend override: {value!r}")
+
+
+def _caller_set_predicates(predicates: Optional[Mapping[str, bool]]) -> bool:
+    return bool(predicates)
+
+
+def _first_verb(text: str) -> Optional[str]:
+    match = re.search(r"[A-Za-z][A-Za-z_-]*", text or "")
+    return match.group(0).lower() if match else None
+
+
+def _lexical_backend(prompt: str, gate_policy: Mapping) -> tuple[Optional[str], Optional[str]]:
+    """Conservative lexical fallback per locked decision #11575.
+
+    Returns Forge only when the first verb is in policy's hard Forge verb list
+    and is not a soft execution-flavoured verb. Configured Janus verbs resolve
+    Janus. Unknown or soft execution-flavoured verbs fall back to ambiguous
+    Janus instead of receiving a lexical-inferred reason.
+    """
+    verb = _first_verb(prompt)
+    forge_verbs = {str(v).lower() for v in gate_policy.get("lexical_forge_verbs", [])}
+    janus_verbs = {str(v).lower() for v in gate_policy.get("lexical_janus_verbs", [])}
+    if verb in forge_verbs and verb not in SOFT_EXEC_FLAVOURED_VERBS:
+        return BACKEND_FORGE, verb
+    if verb in janus_verbs:
+        return BACKEND_JANUS, verb
+    return None, verb
+
+
+def backend_gate(
+    *,
+    explicit_backend_override: Optional[str] = None,
+    predicates: Optional[Mapping[str, bool]] = None,
+    task_class: Optional[str] = None,
+    prompt: str = "",
+    policy_path: str = POLICY_PATH,
+    policy: Optional[Mapping] = None,
+) -> BackendGateDecision:
+    """Resolve Forge vs Janus in strict backend-gate order.
+
+    Order:
+    1. explicit override
+    2. any hard Forge predicate true
+    3. all Janus predicates true
+    4. task_class_backend hint
+    5. conservative lexical fallback only if the caller set no predicates
+    6. ambiguous default
+    """
+    policy = policy or _load_policy(policy_path)
+    gate_policy = policy.get("backend_gate", {}) or {}
+    predicate_values = dict(predicates or {})
+
+    override = _normalise_backend(explicit_backend_override)
+    if override:
+        return BackendGateDecision(override, "override")
+
+    forge_predicates = gate_policy.get("forge_predicates", []) or []
+    if any(bool(predicate_values.get(name)) for name in forge_predicates):
+        return BackendGateDecision(BACKEND_FORGE, "forge_predicate")
+
+    janus_predicates = gate_policy.get("janus_predicates_all", []) or []
+    if janus_predicates and all(bool(predicate_values.get(name)) for name in janus_predicates):
+        return BackendGateDecision(BACKEND_JANUS, "janus_predicate")
+
+    task_map = policy.get("task_class_backend", {}) or {}
+    if task_class in task_map:
+        return BackendGateDecision(_normalise_backend(task_map[task_class]), "task_class")
+
+    if not _caller_set_predicates(predicates) and prompt:
+        backend, verb = _lexical_backend(prompt, gate_policy)
+        if backend:
+            logger.info("backend_gate lexical-inferred verb=%s backend=%s", verb, backend)
+            return BackendGateDecision(backend, "lexical-inferred")
+
+    ambiguous_default = _normalise_backend(gate_policy.get("ambiguous_default", BACKEND_JANUS))
+    return BackendGateDecision(ambiguous_default or BACKEND_JANUS, "ambiguous")
 
 
 def _conn():
@@ -64,6 +365,10 @@ def _quality_floor(con, task: RouteTask) -> float:
     # error-sensitivity fallback
     return {"low": 0.65, "medium": 0.70, "high": 0.85, "critical": 0.90}.get(
         task.error_sensitivity or "medium", 0.70)
+
+
+def _route_columns(con) -> set[str]:
+    return {row["name"] for row in con.execute("PRAGMA table_info(routes)")}
 
 
 def _predicted_success(con, route, task: RouteTask, floor: float) -> float:
@@ -90,50 +395,230 @@ def _predicted_success(con, route, task: RouteTask, floor: float) -> float:
     return seed if seed is not None else floor
 
 
+def _route_is_cli_smoke_healthy(route) -> bool:
+    """Locked decision #11573: only path-native cli-smoke ok is healthy."""
+    return route["healthcheck_type"] == "cli-smoke" and route["last_health"] == "ok"
+
+
+def _route_quota_ok(con, route, route_cols: set[str]) -> bool:
+    if "quota_status" in route_cols:
+        status = (route["quota_status"] or "ok").strip().lower()
+        if status not in {"ok", "available", "healthy", "pass", "unknown"}:
+            return False
+    try:
+        caps = con.execute(
+            "SELECT limit_units, used_units FROM route_capacity WHERE route_id=?",
+            (route["route_id"],),
+        ).fetchall()
+    except sqlite3.Error:
+        return True
+    for cap in caps:
+        limit = cap["limit_units"]
+        if limit is not None and (cap["used_units"] or 0) >= limit:
+            return False
+    return True
+
+
+def _route_capability_ok(route, route_cols: set[str], required: tuple[str, ...]) -> bool:
+    if not required:
+        return True
+    if "capabilities" not in route_cols:
+        return False
+    raw = route["capabilities"]
+    if raw is None:
+        return False
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            available = {str(k) for k, v in parsed.items() if v}
+        elif isinstance(parsed, list):
+            available = {str(v) for v in parsed}
+        else:
+            available = {str(parsed)}
+    except (TypeError, json.JSONDecodeError):
+        available = {part.strip() for part in str(raw).split(",") if part.strip()}
+    return set(required).issubset(available)
+
+
+def _quota_score(con, route) -> float:
+    try:
+        caps = con.execute(
+            "SELECT limit_units, used_units FROM route_capacity WHERE route_id=?",
+            (route["route_id"],),
+        ).fetchall()
+    except sqlite3.Error:
+        return 1.0
+    ratios = []
+    for cap in caps:
+        limit = cap["limit_units"]
+        if limit is None or limit <= 0:
+            continue
+        ratios.append(max(0.0, min(1.0, (limit - (cap["used_units"] or 0)) / limit)))
+    return min(ratios) if ratios else 1.0
+
+
+def _latency_value(route, route_cols: set[str]) -> Optional[float]:
+    for col in ("latency_ms", "p50_latency_ms", "last_latency_ms"):
+        if col in route_cols and route[col] is not None:
+            return float(route[col])
+    return None
+
+
+def _normalise_lower_is_better(value: float, values: list[float]) -> float:
+    if not values:
+        return 1.0
+    lo, hi = min(values), max(values)
+    if hi <= lo:
+        return 1.0
+    return 1.0 - ((value - lo) / (hi - lo))
+
+
+def _policy_weights(policy: Mapping, backend: str) -> Mapping[str, float]:
+    scoring = policy.get("scoring", {}) or {}
+    key = f"{backend}_weights"
+    weights = scoring.get(key, {}) or {}
+    return {
+        "health": float(weights.get("health", 0.0)),
+        "quota": float(weights.get("quota", 0.0)),
+        "quality": float(weights.get("quality", 0.0)),
+        "cost": float(weights.get("cost", 0.0)),
+        "latency": float(weights.get("latency", 0.0)),
+        "path_preference": float(weights.get("path_preference", 0.0)),
+    }
+
+
+def _path_preference(policy: Mapping, cost_mode: Optional[str]) -> float:
+    scoring = policy.get("scoring", {}) or {}
+    bonus = scoring.get("path_preference_bonus", {}) or {}
+    return float(bonus.get(cost_mode or "", 0.0))
+
+
 def select_route(task: RouteTask) -> RoutePlan:
     con = _conn()
     try:
+        policy = _load_policy()
+        gate = backend_gate(
+            explicit_backend_override=task.explicit_backend_override,
+            predicates=task.predicates,
+            task_class=task.task_class,
+            prompt=task.prompt,
+            policy=policy,
+        )
         floor = _quality_floor(con, task)
+        route_cols = _route_columns(con)
+        optional = [
+            col for col in (
+                "healthcheck_type", "last_health", "quota_status", "capabilities",
+                "latency_ms", "p50_latency_ms", "last_latency_ms",
+            )
+            if col in route_cols
+        ]
+        required_cols = ["route_id", "backend", "tool", "access_path", "model_id", "cost_mode", "enabled"]
+        select_cols = required_cols + [col for col in optional if col not in required_cols]
+        missing_health = {"healthcheck_type", "last_health"} - route_cols
+        if missing_health:
+            detail = f"routes table missing health columns: {sorted(missing_health)}"
+            return RoutePlan(None, None, None, 0.0, floor, 0.0, False, [], 0,
+                             detail, gate.backend, gate.reason, 0.0,
+                             {"code": "no_healthy_route", "message": detail})
         routes = con.execute(
-            "SELECT route_id, backend, tool, access_path, model_id, cost_mode, enabled "
-            "FROM routes WHERE enabled=1").fetchall()
+            f"SELECT {', '.join(select_cols)} FROM routes WHERE enabled=1").fetchall()
         ctask = costmod.Task(est_input_tokens=task.estimated_input_tokens,
                              est_output_tokens=task.estimated_output_tokens,
                              task_class=task.task_class)
-        scored = []
+        candidates = []
+        excluded = {"backend": 0, "health": 0, "quota": 0, "capability": 0}
         for r in routes:
+            if r["backend"] != gate.backend:
+                excluded["backend"] += 1
+                continue
+            if not _route_is_cli_smoke_healthy(r):
+                excluded["health"] += 1
+                continue
+            if not _route_quota_ok(con, r, route_cols):
+                excluded["quota"] += 1
+                continue
+            if not _route_capability_ok(r, route_cols, tuple(task.required_capabilities)):
+                excluded["capability"] += 1
+                continue
             eff = costmod.effective_cost(r["route_id"], ctask, con)
             psucc = _predicted_success(con, r, task, floor)
-            scored.append({
+            candidates.append({
                 "route_id": r["route_id"], "model_id": r["model_id"],
                 "cost_mode": r["cost_mode"], "eff": eff,
                 "psucc": psucc, "clears": psucc >= floor,
+                "quota_score": _quota_score(con, r),
+                "path_preference": _path_preference(policy, r["cost_mode"]),
+                "latency": _latency_value(r, route_cols),
             })
-        # predict-then-optimise: among routes that clear the floor, cheapest wins.
-        clearing = [s for s in scored if s["clears"]]
-        pool = clearing if clearing else scored  # if none clear, fall back to all
-        pool.sort(key=lambda s: (s["eff"], -s["psucc"]))
-        best = pool[0] if pool else None
-        fallbacks = [s["route_id"] for s in pool[1:5]]
 
-        if best is None:
+        if not candidates:
+            if gate.backend == BACKEND_JANUS:
+                err = {"code": "no_janus_route_available", "message": "no Janus route available"}
+                rationale = (
+                    f"backend={gate.backend} reason={gate.reason} | "
+                    f"health_key=healthcheck_type:cli-smoke,last_health:ok | "
+                    f"excluded={excluded} | no Janus route available"
+                )
+                return RoutePlan(None, None, None, 0.0, floor, 0.0, False, [], 0,
+                                 rationale, gate.backend, gate.reason, 0.0, err)
+            err = {"code": "no_healthy_route", "message": f"no healthy {gate.backend} route available"}
+            rationale = (
+                f"backend={gate.backend} reason={gate.reason} | "
+                f"health_key=healthcheck_type:cli-smoke,last_health:ok | excluded={excluded}"
+            )
             return RoutePlan(None, None, None, 0.0, floor, 0.0, False, [], 0,
-                             "no enabled routes")
+                             rationale, gate.backend, gate.reason, 0.0, err)
 
-        used_fallback = not clearing
+        costs = [s["eff"] for s in candidates]
+        latencies = [s["latency"] for s in candidates if s["latency"] is not None]
+        weights = _policy_weights(policy, gate.backend)
+        for s in candidates:
+            components = {
+                "health": 1.0,
+                "quota": s["quota_score"],
+                "quality": s["psucc"],
+                "cost": _normalise_lower_is_better(s["eff"], costs),
+                "latency": _normalise_lower_is_better(s["latency"], latencies) if s["latency"] is not None else 1.0,
+                "path_preference": s["path_preference"],
+            }
+            s["score"] = sum(weights[name] * components[name] for name in weights)
+            s["components"] = components
+
+        candidates.sort(key=lambda s: (s["score"], s["psucc"], -s["eff"]), reverse=True)
+        best = candidates[0]
+        fallbacks = [s["route_id"] for s in candidates[1:5]]
+
+        if not best["clears"]:
+            err = {"code": "quality_floor_not_met", "message": "no route cleared quality floor"}
+            rationale = (
+                f"backend={gate.backend} reason={gate.reason} | floor={floor:.2f} | "
+                f"strategy=within-backend-weighted-argmax | "
+                f"health_key=healthcheck_type:cli-smoke,last_health:ok | "
+                f"candidates={len(candidates)} excluded={excluded} | "
+                f"best={best['route_id']} score={best['score']:.3f} psucc={best['psucc']:.2f} floor_fail"
+            )
+            return RoutePlan(None, None, None, round(best["eff"], 6), floor,
+                             round(best["psucc"], 3), False, fallbacks,
+                             len(candidates), rationale, gate.backend, gate.reason,
+                             round(best["score"], 6), err)
+
         rationale = (
-            f"task_class={task.task_class} | floor={floor:.2f} | "
-            f"strategy=cheapest-route-clearing-floor"
-            + (" [NO route cleared floor, took cheapest overall]" if used_fallback else "")
-            + f" | candidates={len(scored)} clearing={len(clearing)}"
-            + f" | picked {best['route_id']} eff=${best['eff']:.6f} psucc={best['psucc']:.2f}"
+            f"backend={gate.backend} reason={gate.reason} | task_class={task.task_class} | "
+            f"floor={floor:.2f} | strategy=within-backend-weighted-argmax | "
+            f"weights={dict(weights)} | health_key=healthcheck_type:cli-smoke,last_health:ok | "
+            f"candidates={len(candidates)} excluded={excluded} | "
+            f"picked {best['route_id']} score={best['score']:.3f} "
+            f"eff=${best['eff']:.6f} psucc={best['psucc']:.2f}"
         )
         return RoutePlan(
             selected_route=best["route_id"], selected_model=best["model_id"],
             cost_mode=best["cost_mode"], effective_cost=round(best["eff"], 6),
             quality_floor=floor, predicted_success=round(best["psucc"], 3),
-            cleared_floor=not used_fallback, fallback_chain=fallbacks,
-            candidate_count=len(scored), rationale=rationale,
+            cleared_floor=True, fallback_chain=fallbacks,
+            candidate_count=len(candidates), rationale=rationale,
+            backend=gate.backend, backend_reason=gate.reason,
+            scorer_score=round(best["score"], 6),
         )
     finally:
         con.close()
