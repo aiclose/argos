@@ -27,6 +27,12 @@ KAPPA_MULT = 5.0          # kappa = 5 * eta (steepness once into reserve)
 GAMMA = 1.0               # psi(tau) = tau^gamma (use-it-or-lose-it decay)
 NOMINAL_CAPACITY_COST = 0.0005   # charged to capped/sunk lanes when limit unknown,
                                  # so they are cheap-but-never-zero (in USD-ish units)
+MAX_CAPACITY_COST = 100.0        # hard clamp on the >100%% "sting". The convex _phi
+                                 # ramps to ~eta at the cap then explodes past it
+                                 # ($427 at 110%%, far more beyond) - intended as a
+                                 # wall, but bounded here so it stays prohibitive
+                                 # ($100 >> any real lane's cents) without producing
+                                 # absurd/overflowing magnitudes downstream.
 DEFAULT_EST_INPUT = 4000  # fallback token estimates if task omits them
 DEFAULT_EST_OUTPUT = 1500
 
@@ -72,6 +78,37 @@ def _phi(R, reserve, limit):
     # below reserve: 1 + kappa-scaled quadratic (steep)
     return 1.0 + KAPPA_MULT * ((reserve - R) / max(1.0, reserve)) ** 2
 
+def _bucket_quota_cost(con, route, eta):
+    """Convex shadow price as a route's BUCKET nears its daily quota cap.
+    Reads quota_caps (daily caps) vs quota_usage (today's garage-local-AEST
+    usage). Reuses _phi (reserve=0: price stays ~0 until within the buffer
+    band of exhaustion, then ramps convexly, then steep once over cap).
+    Returns 0 for buckets with no caps (unlimited flat-rate lanes)."""
+    rid = route["route_id"]
+    r = con.execute("SELECT quota_bucket FROM routes WHERE route_id=?", (rid,)).fetchone()
+    bucket = r[0] if r and r[0] else None
+    if not bucket:
+        return 0.0
+    cap = con.execute(
+        "SELECT daily_requests_cap, daily_tokens_cap, daily_cost_cap_usd "
+        "FROM quota_caps WHERE bucket=?", (bucket,)).fetchone()
+    if not cap:
+        return 0.0
+    import time as _t
+    day = _t.strftime("%Y-%m-%d")  # matches the ledger writer (_augment_dispatch)
+    use = con.execute(
+        "SELECT requests, input_tokens + output_tokens, cost_usd "
+        "FROM quota_usage WHERE bucket=? AND day=?", (bucket, day)).fetchone()
+    used_req, used_tok, used_cost = (use or (0, 0, 0.0))
+    worst = 0.0
+    for cap_v, used_v in ((cap[0], used_req), (cap[1], used_tok), (cap[2], used_cost)):
+        if not cap_v or cap_v <= 0:
+            continue  # dimension unlimited
+        R = cap_v - (used_v or 0)        # remaining in this dimension
+        shape = _phi(R, 0.0, cap_v)      # reserve=0 -> ramp only near exhaustion
+        worst = max(worst, (eta or 0.0) * shape)
+    return worst
+
 
 def capacity_cost(con, route, task: Task, eta: float | None = None) -> float:
     """Shadow price for capped/sunk lanes. Convex soft-reservation * pacing * time."""
@@ -83,8 +120,6 @@ def capacity_cost(con, route, task: Task, eta: float | None = None) -> float:
         "SELECT window, limit_units, used_units, reserve_target, lambda_w, "
         "window_length_sec, resets_at FROM route_capacity WHERE route_id=?",
         (rid,)).fetchall()
-    if not caps:
-        return NOMINAL_CAPACITY_COST
     # eta default: median cash cost of a decent per-token fallback (computed once)
     if eta is None:
         eta = _median_fallback_cash(con, task)
@@ -114,7 +149,9 @@ def capacity_cost(con, route, task: Task, eta: float | None = None) -> float:
         # floor at nominal so even a fresh capped lane is never literally free
         price = max(price, NOMINAL_CAPACITY_COST)
         worst = max(worst, price)
-    return worst
+    # Stage 4: bucket-level daily quota shadow price (quota_usage vs quota_caps)
+    worst = max(worst, _bucket_quota_cost(con, route, eta))
+    return min(max(worst, NOMINAL_CAPACITY_COST), MAX_CAPACITY_COST)
 
 
 def _median_fallback_cash(con, task: Task) -> float:

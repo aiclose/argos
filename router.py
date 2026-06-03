@@ -429,6 +429,41 @@ def _get_dispatches_columns():
             _DISPATCHES_COLUMNS = [r[1] for r in db.execute("PRAGMA table_info(dispatches)").fetchall()]
     return _DISPATCHES_COLUMNS
 
+def _augment_dispatch(filtered):
+    """Price per_token routes from model_prices; track quota_usage for every route bucket.
+    Sunk/flat_rate_capped lanes keep zero cash cost but still count toward quota.
+    Best-effort: never raises into the handler."""
+    try:
+        model = filtered.get("model_used")
+        intok = filtered.get("actual_input_tokens") or 0
+        outtok = filtered.get("actual_output_tokens") or 0
+        cost = filtered.get("actual_cost_usd") or 0.0
+        if not model:
+            return
+        with sqlite3.connect(ARGOS_DB, timeout=30) as db:
+            route = db.execute("SELECT quota_bucket, cost_mode FROM routes WHERE model_id=? ORDER BY enabled DESC LIMIT 1", (model,)).fetchone()
+            bucket = route[0] if route else None
+            cost_mode = route[1] if route else None
+            if (not cost) and cost_mode == "per_token" and (intok or outtok):
+                pr = db.execute("SELECT input_per_1m_usd, output_per_1m_usd FROM model_prices WHERE model_id=?", (model,)).fetchone()
+                if pr:
+                    cost = (intok / 1000000.0) * (pr[0] or 0.0) + (outtok / 1000000.0) * (pr[1] or 0.0)
+                    filtered["actual_cost_usd"] = round(cost, 6)
+            if bucket:
+                import time as _t
+                day = _t.strftime("%Y-%m-%d"); now = _t.strftime("%Y-%m-%d %H:%M:%S")
+                db.execute("""INSERT INTO quota_usage(bucket,day,requests,input_tokens,output_tokens,cost_usd,updated_at)
+                              VALUES(?,?,1,?,?,?,?)
+                              ON CONFLICT(bucket,day) DO UPDATE SET requests=requests+1,
+                                input_tokens=input_tokens+excluded.input_tokens,
+                                output_tokens=output_tokens+excluded.output_tokens,
+                                cost_usd=cost_usd+excluded.cost_usd, updated_at=excluded.updated_at""",
+                           (bucket, day, intok, outtok, cost or 0.0, now))
+            db.commit()
+    except Exception as e:
+        log(f"_augment_dispatch error: {e}")
+
+
 @app.post("/dispatch-record")
 async def dispatch_record(request: Request):
     from datetime import datetime
@@ -444,6 +479,7 @@ async def dispatch_record(request: Request):
         filtered["dispatch_id"] = str(uuid.uuid4())
     if "ts" not in filtered or not filtered["ts"]:
         filtered["ts"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    _augment_dispatch(filtered)
     cols = list(filtered.keys())
     placeholders = ",".join(["?"] * len(cols))
     col_names = ",".join(cols)
