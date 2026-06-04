@@ -4,3 +4,4 @@ __pycache__/
 *.db.bak-*
 .env
 quality_predictor_history/
+.or_key

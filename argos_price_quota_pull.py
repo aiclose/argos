@@ -2,7 +2,7 @@
 # argos_price_quota_pull.py - daily: refresh model_prices from OpenRouter + derive free-lane quota caps.
 import sqlite3, json, time, urllib.request, sys, os
 DB="/home/andy/argos/argos.db"
-KEYFILE="/tmp/new_or_key.txt"
+KEYFILE="/home/andy/argos/.or_key"
 KEY=open(KEYFILE).read().strip() if os.path.exists(KEYFILE) else os.getenv("OPENROUTER_API_KEY","")
 now=time.strftime("%Y-%m-%d %H:%M:%S")
 def log(m): print(f"[{now}] {m}")
