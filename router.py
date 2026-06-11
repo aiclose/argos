@@ -118,7 +118,7 @@ class TaskRequest(BaseModel):
     domain: Optional[str] = None
     task_type: Optional[str] = None
     notes: Optional[str] = None
-    explicit_backend_override: Optional[str] = Field(None, description="Optional hard backend override: forge or janus")
+    explicit_backend_override: Optional[str] = Field(None, description="Optional hard backend override: forge or spine (janus = deprecated alias)")
     predicates: Optional[Dict[str, bool]] = Field(None, description="Backend-gate predicates supplied by caller")
     required_capabilities: List[str] = Field(default_factory=list, description="Capabilities required from the selected route")
 

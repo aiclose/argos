@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os as _os
 _envf = "/home/andy/argos/.env"
 if _os.path.exists(_envf):
@@ -20,7 +21,6 @@ Cap 100 trials/arm.
 Usage: python3 weekly_eval_sprt.py [--dry-run] [--db PATH] [--tasks TASKS.json]
                                    [--max-trials N] [--classes c1,c2]
 """
-from __future__ import annotations
 import argparse, json, math, os, sqlite3, time, uuid, urllib.request
 from datetime import datetime, timezone
 

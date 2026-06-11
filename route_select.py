@@ -33,11 +33,14 @@ DB_PATH = "/home/andy/argos/argos.db"
 POLICY_PATH = os.path.join(os.path.dirname(__file__), "argos-policy.yaml")
 DEFAULT_POLICY_PATH = os.path.join(os.path.dirname(__file__), "argos-policy.defaults.yaml")
 BACKEND_FORGE = "forge"
-BACKEND_JANUS = "janus"
+BACKEND_SPINE = "spine"  # the not-Forge backend: langgraph-spine fronting LiteLLM
+# Naming lineage: orchestrator -> Janus -> Pharos -> RETIRED (LGSPINE-003/004).
+# "janus" is accepted on input as a deprecated alias only; never emitted.
+LEGACY_BACKEND_ALIASES = {"janus": BACKEND_SPINE}
 BACKEND_GATE_REASONS = {
     "override",
     "forge_predicate",
-    "janus_predicate",
+    "spine_predicate",
     "task_class",
     "ambiguous",
     "lexical-inferred",
@@ -200,9 +203,9 @@ def _validate_policy(policy: dict, path: str) -> None:
     gate = _require_mapping(policy, "backend_gate")
     _normalise_backend(gate.get("ambiguous_default"))
     _require_string_list(gate, "forge_predicates")
-    _require_string_list(gate, "janus_predicates_all")
+    _require_string_list(gate, "spine_predicates_all")
     _require_string_list(gate, "lexical_forge_verbs")
-    _require_string_list(gate, "lexical_janus_verbs")
+    _require_string_list(gate, "lexical_spine_verbs")
 
     task_map = _require_mapping(policy, "task_class_backend")
     for task_class, backend in task_map.items():
@@ -211,7 +214,7 @@ def _validate_policy(policy: dict, path: str) -> None:
         _normalise_backend(backend)
 
     scoring = _require_mapping(policy, "scoring")
-    for weight_key in ("forge_weights", "janus_weights"):
+    for weight_key in ("forge_weights", "spine_weights"):
         weights = scoring.get(weight_key)
         if not isinstance(weights, Mapping):
             raise ValueError(f"policy.scoring.{weight_key} must be a mapping")
@@ -267,7 +270,11 @@ def _normalise_backend(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     backend = str(value).strip().lower()
-    if backend in {BACKEND_FORGE, BACKEND_JANUS}:
+    if backend in LEGACY_BACKEND_ALIASES:
+        canonical = LEGACY_BACKEND_ALIASES[backend]
+        logger.warning("deprecated backend name %r normalised to %r", backend, canonical)
+        return canonical
+    if backend in {BACKEND_FORGE, BACKEND_SPINE}:
         return backend
     raise ValueError(f"unsupported backend override: {value!r}")
 
@@ -285,17 +292,17 @@ def _lexical_backend(prompt: str, gate_policy: Mapping) -> tuple[Optional[str], 
     """Conservative lexical fallback per locked decision #11575.
 
     Returns Forge only when the first verb is in policy's hard Forge verb list
-    and is not a soft execution-flavoured verb. Configured Janus verbs resolve
-    Janus. Unknown or soft execution-flavoured verbs fall back to ambiguous
-    Janus instead of receiving a lexical-inferred reason.
+    and is not a soft execution-flavoured verb. Configured spine verbs resolve
+    spine. Unknown or soft execution-flavoured verbs fall back to ambiguous
+    spine instead of receiving a lexical-inferred reason.
     """
     verb = _first_verb(prompt)
     forge_verbs = {str(v).lower() for v in gate_policy.get("lexical_forge_verbs", [])}
-    janus_verbs = {str(v).lower() for v in gate_policy.get("lexical_janus_verbs", [])}
+    spine_verbs = {str(v).lower() for v in gate_policy.get("lexical_spine_verbs", [])}
     if verb in forge_verbs and verb not in SOFT_EXEC_FLAVOURED_VERBS:
         return BACKEND_FORGE, verb
-    if verb in janus_verbs:
-        return BACKEND_JANUS, verb
+    if verb in spine_verbs:
+        return BACKEND_SPINE, verb
     return None, verb
 
 
@@ -308,12 +315,12 @@ def backend_gate(
     policy_path: str = POLICY_PATH,
     policy: Optional[Mapping] = None,
 ) -> BackendGateDecision:
-    """Resolve Forge vs Janus in strict backend-gate order.
+    """Resolve Forge vs spine in strict backend-gate order.
 
     Order:
     1. explicit override
     2. any hard Forge predicate true
-    3. all Janus predicates true
+    3. all spine predicates true
     4. task_class_backend hint
     5. conservative lexical fallback only if the caller set no predicates
     6. ambiguous default
@@ -330,9 +337,9 @@ def backend_gate(
     if any(bool(predicate_values.get(name)) for name in forge_predicates):
         return BackendGateDecision(BACKEND_FORGE, "forge_predicate")
 
-    janus_predicates = gate_policy.get("janus_predicates_all", []) or []
-    if janus_predicates and all(bool(predicate_values.get(name)) for name in janus_predicates):
-        return BackendGateDecision(BACKEND_JANUS, "janus_predicate")
+    spine_predicates = gate_policy.get("spine_predicates_all", []) or []
+    if spine_predicates and all(bool(predicate_values.get(name)) for name in spine_predicates):
+        return BackendGateDecision(BACKEND_SPINE, "spine_predicate")
 
     task_map = policy.get("task_class_backend", {}) or {}
     if task_class in task_map:
@@ -344,8 +351,8 @@ def backend_gate(
             logger.info("backend_gate lexical-inferred verb=%s backend=%s", verb, backend)
             return BackendGateDecision(backend, "lexical-inferred")
 
-    ambiguous_default = _normalise_backend(gate_policy.get("ambiguous_default", BACKEND_JANUS))
-    return BackendGateDecision(ambiguous_default or BACKEND_JANUS, "ambiguous")
+    ambiguous_default = _normalise_backend(gate_policy.get("ambiguous_default", BACKEND_SPINE))
+    return BackendGateDecision(ambiguous_default or BACKEND_SPINE, "ambiguous")
 
 
 def _conn():
@@ -553,12 +560,12 @@ def select_route(task: RouteTask) -> RoutePlan:
             })
 
         if not candidates:
-            if gate.backend == BACKEND_JANUS:
-                err = {"code": "no_janus_route_available", "message": "no Janus route available"}
+            if gate.backend == BACKEND_SPINE:
+                err = {"code": "no_spine_route_available", "message": "no spine route available"}
                 rationale = (
                     f"backend={gate.backend} reason={gate.reason} | "
                     f"health_key=healthcheck_type:cli-smoke,last_health:ok | "
-                    f"excluded={excluded} | no Janus route available"
+                    f"excluded={excluded} | no spine route available"
                 )
                 return RoutePlan(None, None, None, 0.0, floor, 0.0, False, [], 0,
                                  rationale, gate.backend, gate.reason, 0.0, err)

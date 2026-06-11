@@ -33,7 +33,22 @@ def _init_db(path: str) -> None:
             last_health TEXT,
             quota_status TEXT,
             capabilities TEXT,
-            latency_ms REAL
+            latency_ms REAL,
+            quota_bucket TEXT
+        );
+        CREATE TABLE quota_caps (
+            bucket TEXT PRIMARY KEY,
+            daily_requests_cap REAL,
+            daily_tokens_cap REAL,
+            daily_cost_cap_usd REAL
+        );
+        CREATE TABLE quota_usage (
+            bucket TEXT,
+            day TEXT,
+            requests INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cost_usd REAL
         );
         CREATE TABLE model_prices (
             model_id TEXT PRIMARY KEY,
@@ -79,8 +94,9 @@ def _init_db(path: str) -> None:
         """
         INSERT INTO routes
         (route_id, backend, tool, access_path, model_id, cost_mode, enabled,
-         healthcheck_type, last_health, quota_status, capabilities, latency_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         healthcheck_type, last_health, quota_status, capabilities, latency_ms,
+         quota_bucket)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
         """,
         [
             (
@@ -112,9 +128,9 @@ def _init_db(path: str) -> None:
                 100.0,
             ),
             (
-                "janus:stale-openrouter:gpt-5.3",
-                "janus",
-                "openrouter",
+                "spine:litellm:gpt-5.3",
+                "spine",
+                "litellm",
                 "api-chat",
                 "openai/gpt-5.3",
                 "per_token",
