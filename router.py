@@ -6,6 +6,7 @@ SHADOW MODE: does NOT actually dispatch in v0.1.
 Listens on 0.0.0.0:3020.
 """
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from typing import Dict, Optional, List
 import yaml
@@ -350,7 +351,7 @@ def reload_quality_model():
     ok = _load_quality_model()
     return {"ok": ok, "model_loaded": _QUALITY_MODEL is not None}
 
-@app.get("/metrics", response_class=None)
+@app.get("/metrics", response_class=PlainTextResponse)
 def metrics():
     """Prometheus exposition format. Manual implementation (no prometheus_client dep needed)."""
     db = sqlite3.connect(ARGOS_DB, timeout=30)
