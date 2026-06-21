@@ -1,0 +1,76 @@
+# Argos routing rules v0.1 - Phase 1 deterministic logic
+# Hand-tuned defaults. Phase 2 ML predictors will refine these.
+
+tier_definitions:
+  tier_1:
+    description: "Flagship / Opus-equivalent"
+    examples: ["anthropic/claude-opus-4.7", "openai/gpt-5", "google/gemini-2.5-pro"]
+  tier_2:
+    description: "Workhorse / Sonnet-equivalent"
+    examples: ["anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5", "openai/gpt-4o"]
+  tier_3:
+    description: "Fast/cheap / local or sub-$5/M"
+    examples: ["deepseek/deepseek-v3.2", "google/gemini-2.5-flash", "ollama/*"]
+
+quality_floors:
+  critical: 0.95
+  high: 0.85
+  medium: 0.70
+  low: 0.50
+
+# Map each of 24 task classes to default tier
+task_class_routing:
+  # Tier 1 - high stakes / complex reasoning
+  architecture_design:    {default_tier: tier_1, error_sensitivity_default: critical}
+  security:               {default_tier: tier_1, error_sensitivity_default: critical}
+  code_algorithmic:       {default_tier: tier_1, error_sensitivity_default: high}
+  debugging_intermittent: {default_tier: tier_1, error_sensitivity_default: high}
+
+  # Tier 2 - workhorse for typical code work
+  code_generation:        {default_tier: tier_2, error_sensitivity_default: high}
+  code_implementation:    {default_tier: tier_2, error_sensitivity_default: high}
+  refactoring:            {default_tier: tier_2, error_sensitivity_default: high}
+  debugging:              {default_tier: tier_2, error_sensitivity_default: medium}
+  debugging_simple:       {default_tier: tier_2, error_sensitivity_default: medium}
+  data_engineering:       {default_tier: tier_2, error_sensitivity_default: high}
+  devops:                 {default_tier: tier_2, error_sensitivity_default: high}
+  test_integration:       {default_tier: tier_2, error_sensitivity_default: medium}
+  docs_api:               {default_tier: tier_2, error_sensitivity_default: medium}
+  analysis:               {default_tier: tier_2, error_sensitivity_default: medium}
+
+  # Tier 3 - cheap/easy
+  code_boilerplate:       {default_tier: tier_3, error_sensitivity_default: low}
+  test_unit:              {default_tier: tier_3, error_sensitivity_default: low}
+  testing:                {default_tier: tier_3, error_sensitivity_default: low}
+  documentation:          {default_tier: tier_3, error_sensitivity_default: low}
+  docs_explainer:         {default_tier: tier_3, error_sensitivity_default: low}
+  formatting:             {default_tier: tier_3, error_sensitivity_default: low}
+  classification:         {default_tier: tier_3, error_sensitivity_default: medium}
+  conversation:           {default_tier: tier_3, error_sensitivity_default: low}
+  creative:               {default_tier: tier_3, error_sensitivity_default: low}
+  extraction:             {default_tier: tier_3, error_sensitivity_default: medium}
+
+# Hard constraints (override default tier)
+constraints:
+  - name: "critical sensitivity requires tier 1"
+    when: {error_sensitivity: critical}
+    require_tier: tier_1
+  - name: "production migration requires tier 1"
+    when: {task_type: production_migration}
+    require_tier: tier_1
+
+routing_strategy:
+  # 0.7 = prefer quality up to 70%, cost 30% (Kimi's aggressiveness param)
+  alpha: 0.7
+  # v1: only consider models with litellm_alias (the 17 routable through our gateway)
+  prefer_litellm_routable: true
+  # If true, requests are logged to predictions table but NOT actually dispatched
+  shadow_mode: true
+
+exploration:
+  enabled: false  # Phase 4 will turn this on
+  max_low_risk_traffic_percent: 5
+  disallow_when:
+    - error_sensitivity_above: high
+    - domain: security
+    - task_type: production_migration

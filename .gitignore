@@ -1,7 +1,27 @@
+# Python
 *.pyc
 __pycache__/
+venv/
+.venv/
+
+# Databases + binaries (runtime state, not source)
 *.db
 *.db.bak-*
-.env
+*.db.pre-*
+*.pkl
 quality_predictor_history/
+
+# Secrets
+.env
+.env.template
+.litellm-key
 .or_key
+
+# Backups + transient state
+*.bak
+*.bak-*
+*.bak.*
+*-state.json
+dispatch-tail-state.json
+logs/
+quality_predictor.pkl
