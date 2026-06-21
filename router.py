@@ -37,6 +37,15 @@ try:
 except Exception as _e:
     _rsel = None
 
+# U2-001: deterministic task_class fallback (single source of truth for both the
+# live /dispatch-record path below and backfill_task_class.py).
+from backfill_task_class import (
+    classify_task_class,
+    _ensure_sentinel_task_class,
+    SENTINEL_TASK_CLASS,
+    VALID_TASK_CLASSES,
+)
+
 _QUALITY_MODEL = None
 
 def _load_quality_model():
@@ -463,6 +472,24 @@ def _augment_dispatch(filtered):
             db.commit()
     except Exception as e:
         log(f"_augment_dispatch error: {e}")
+
+    # U2-001: never leave task_class NULL/empty on the record path. The table has
+    # no text column, so this is a deterministic tag-prefix mapping with an
+    # honest "unclassified" sentinel fallback -- NOT a fabricated semantic class.
+    # Own try/except: best-effort, must never raise into the handler.
+    try:
+        existing = filtered.get("task_class")
+        if not (existing and str(existing).strip() in VALID_TASK_CLASSES):
+            cls = classify_task_class(filtered.get("dispatch_id"), existing)
+            if cls == SENTINEL_TASK_CLASS:
+                # Register the sentinel in task_classes BEFORE the dispatches
+                # INSERT references it, keeping the FK valid. Idempotent.
+                with sqlite3.connect(ARGOS_DB, timeout=30) as db:
+                    _ensure_sentinel_task_class(db)
+                    db.commit()
+            filtered["task_class"] = cls
+    except Exception as e:
+        log(f"_augment_dispatch task_class fallback error: {e}")
 
 
 @app.post("/dispatch-record")
