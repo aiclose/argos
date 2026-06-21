@@ -27,7 +27,8 @@ except ModuleNotFoundError:  # keep policy loading dependency-free in minimal en
     yaml = None
 
 import cost as costmod  # the effective_cost module built alongside this
-import route_priors  # benchmark-seeded warm-start priors
+import route_priors  # benchmark-seeded (stale) warm-start priors
+import route_priors_dynamic  # U4: live panel/champion warm-start boost (shadow-only)
 
 DB_PATH = "/home/andy/argos/argos.db"
 POLICY_PATH = os.path.join(os.path.dirname(__file__), "argos-policy.yaml")
@@ -378,7 +379,7 @@ def _route_columns(con) -> set[str]:
     return {row["name"] for row in con.execute("PRAGMA table_info(routes)")}
 
 
-def _predicted_success(con, route, task: RouteTask, floor: float) -> float:
+def _predicted_success(con, route, task: RouteTask, floor: float) -> tuple[float, Optional[str]]:
     """Predict route success, in priority order:
     1. Observed accept rate for this route+task_class if >= MIN_OBS labels (real data wins).
     2. Otherwise a benchmark-seeded warm-start prior (route_priors), so routes
@@ -387,6 +388,16 @@ def _predicted_success(con, route, task: RouteTask, floor: float) -> float:
 
     As real route-spread outcomes accumulate, (1) overrides the seed. This is the
     research's warm-start: benchmark priors now, learned rates later.
+
+    U4-001: on the COLD-START tiers (2/3 only) we additionally apply a bounded,
+    boost-only nudge from live evidence (panel_decisions / champions) via
+    route_priors_dynamic. Tier-1 observed data is authoritative and is returned
+    UNCHANGED -- we never boost over real labels. Still shadow: this only sharpens
+    the predicted-success prior, it does not touch gates or steer traffic.
+
+    Returns (predicted_success, prior_note). prior_note is None for tier-1 and for
+    un-boosted cold starts; otherwise it is a short string describing the boost,
+    threaded into the route rationale for transparency.
     """
     MIN_OBS = 5
     mid = route["model_id"]
@@ -396,10 +407,21 @@ def _predicted_success(con, route, task: RouteTask, floor: float) -> float:
             "FROM dispatches WHERE model_used=? AND task_class=? AND accepted IS NOT NULL",
             (mid, task.task_class)).fetchone()
         if row and row["n"] and row["n"] >= MIN_OBS and row["rate"] is not None:
-            return float(row["rate"])  # real data overrides the seed
-    # warm-start from benchmark prior
+            return float(row["rate"]), None  # real data overrides the seed; NO boost
+    # warm-start from benchmark prior (tier 2), or floor as last resort (tier 3)
     seed = route_priors.seed_prior(mid, route["tool"], task.error_sensitivity)
-    return seed if seed is not None else floor
+    base = seed if seed is not None else floor
+    # U4: bounded, boost-only panel/champion nudge on the cold-start guess only.
+    # Best-effort -- a malformed panel JSON or missing table must not raise here.
+    try:
+        boosted, reason = route_priors_dynamic.champion_panel_boost(
+            con, route, task.task_class, base)
+    except Exception as exc:  # pragma: no cover - defensive; module is best-effort
+        logger.debug("route_priors_dynamic boost skipped: %s", exc)
+        boosted, reason = base, None
+    if reason:
+        return boosted, f"quality_prior {base:.2f}->{boosted:.2f} ({reason})"
+    return base, None
 
 
 def _route_is_cli_smoke_healthy(route) -> bool:
@@ -549,11 +571,11 @@ def select_route(task: RouteTask) -> RoutePlan:
                 excluded["capability"] += 1
                 continue
             eff = costmod.effective_cost(r["route_id"], ctask, con)
-            psucc = _predicted_success(con, r, task, floor)
+            psucc, prior_note = _predicted_success(con, r, task, floor)
             candidates.append({
                 "route_id": r["route_id"], "model_id": r["model_id"],
                 "cost_mode": r["cost_mode"], "eff": eff,
-                "psucc": psucc, "clears": psucc >= floor,
+                "psucc": psucc, "prior_note": prior_note, "clears": psucc >= floor,
                 "quota_score": _quota_score(con, r),
                 "path_preference": _path_preference(policy, r["cost_mode"]),
                 "latency": _latency_value(r, route_cols),
@@ -618,6 +640,8 @@ def select_route(task: RouteTask) -> RoutePlan:
             f"picked {best['route_id']} score={best['score']:.3f} "
             f"eff=${best['eff']:.6f} psucc={best['psucc']:.2f}"
         )
+        if best.get("prior_note"):  # U4: surface panel/champion warm-start influence
+            rationale += f" | {best['prior_note']}"
         return RoutePlan(
             selected_route=best["route_id"], selected_model=best["model_id"],
             cost_mode=best["cost_mode"], effective_cost=round(best["eff"], 6),
