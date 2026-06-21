@@ -90,12 +90,16 @@ def fetch_new_cost_log_entries(last_id):
         return []
     db = sqlite3.connect(COST_LOG_LOCAL_SNAPSHOT)
     db.row_factory = sqlite3.Row
-    rows = list(db.execute("""
-        SELECT id, ts, tag, model, cost_usd, status, provider_mode, notes
-        FROM cost_log
-        WHERE id > ?
-        ORDER BY id
-    """, (last_id,)))
+    # Prefer structured token columns when the snapshot has them (orchestrator >= U1b);
+    # fall back to the legacy column set for older snapshots.
+    _cl_cols = {r[1] for r in db.execute("PRAGMA table_info(cost_log)")}
+    if "prompt_tokens" in _cl_cols and "completion_tokens" in _cl_cols:
+        _sel = ("SELECT id, ts, tag, model, cost_usd, status, provider_mode, notes, "
+                "prompt_tokens, completion_tokens FROM cost_log WHERE id > ? ORDER BY id")
+    else:
+        _sel = ("SELECT id, ts, tag, model, cost_usd, status, provider_mode, notes "
+                "FROM cost_log WHERE id > ? ORDER BY id")
+    rows = list(db.execute(_sel, (last_id,)))
     db.close()
     return [dict(r) for r in rows]
 
@@ -216,7 +220,11 @@ def main():
                 klass = "conversation"  # fallback
             
             dispatch_id = f"costlog-{item['id']}"
-            tin, tout = parse_tokens(item.get('notes'))
+            # Prefer structured token columns from cost_log; fall back to parsing notes.
+            tin = item.get('prompt_tokens')
+            tout = item.get('completion_tokens')
+            if tin is None and tout is None:
+                tin, tout = parse_tokens(item.get('notes'))
 
             # Insert into dispatches (idempotent)
             try:
