@@ -19,6 +19,7 @@ import json
 import ssl
 import time
 import os
+import re
 import sys
 import shutil
 try:
@@ -45,6 +46,27 @@ def log(m):
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     with open(LOG_PATH, "a") as f:
         f.write(line + "\n")
+
+_TOKENS_RE = re.compile(r"in\s*=\s*([\d,]+).*?out\s*=\s*([\d,]+)", re.IGNORECASE | re.DOTALL)
+
+def parse_tokens(notes):
+    """Extract (input_tokens, output_tokens) from a free-text notes field.
+
+    Looks for the pattern 'tokens in=50 out=20' (case-insensitive, tolerant of
+    extra text/whitespace and commas in the numbers). Returns (None, None) if it
+    cannot parse.
+    """
+    if not notes:
+        return (None, None)
+    m = _TOKENS_RE.search(notes)
+    if not m:
+        return (None, None)
+    try:
+        tin = int(m.group(1).replace(",", ""))
+        tout = int(m.group(2).replace(",", ""))
+        return (tin, tout)
+    except (ValueError, AttributeError):
+        return (None, None)
 
 def get_state():
     if not os.path.exists(STATE_FILE):
@@ -194,22 +216,31 @@ def main():
                 klass = "conversation"  # fallback
             
             dispatch_id = f"costlog-{item['id']}"
+            tin, tout = parse_tokens(item.get('notes'))
 
             # Insert into dispatches (idempotent)
             try:
                 db.execute("""
                     INSERT INTO dispatches
                     (dispatch_id, ts, source, provider_mode, model_used, task_class,
-                     actual_cost_usd, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     actual_cost_usd, status, actual_input_tokens, actual_output_tokens)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     dispatch_id, item['ts'], 'cost_log_tail', item.get('provider_mode'),
-                    item.get('model'), klass, item.get('cost_usd'), item.get('status')
+                    item.get('model'), klass, item.get('cost_usd'), item.get('status'),
+                    tin, tout
                 ))
                 inserted_dispatches += 1
             except sqlite3.IntegrityError:
                 # Already exists - update task_class if missing
                 db.execute("UPDATE dispatches SET task_class = ? WHERE dispatch_id = ? AND task_class IS NULL", (klass, dispatch_id))
+                # Also backfill tokens if currently missing (mirror the task_class update)
+                if tin is not None or tout is not None:
+                    db.execute(
+                        "UPDATE dispatches SET actual_input_tokens = ?, actual_output_tokens = ? "
+                        "WHERE dispatch_id = ? AND (actual_input_tokens IS NULL OR actual_input_tokens = 0)",
+                        (tin, tout, dispatch_id)
+                    )
             db.commit()  # release lock before /route call
 
             # Call argos /route to get shadow recommendation
@@ -243,6 +274,70 @@ def main():
     log("=== argos dispatch tail done ===")
     db.close()
 
+def backfill_tokens_from_notes():
+    """One-time backfill: populate actual_input/output_tokens for existing
+    cost_log_tail dispatches by re-reading the cost_log notes field.
+
+    Scans dispatches where tokens are missing (NULL or 0), looks up the matching
+    cost_log entry via the dispatch_id pattern 'costlog-<id>', parses notes, and
+    updates the row. Safe to run repeatedly (only touches still-missing rows).
+    """
+    log("=== argos token backfill start ===")
+
+    # Use an existing snapshot if present, else pull a fresh one via scp.
+    if os.path.exists(COST_LOG_LOCAL_SNAPSHOT):
+        log(f"using existing cost_log snapshot: {COST_LOG_LOCAL_SNAPSHOT}")
+    else:
+        rc = os.system(f"scp -q {COST_LOG_REMOTE_USER}:{COST_LOG_REMOTE_PATH} {COST_LOG_LOCAL_SNAPSHOT} 2>/dev/null")
+        if rc != 0:
+            log(f"FATAL: scp failed (rc={rc})")
+            return
+        log(f"pulled fresh cost_log snapshot: {COST_LOG_LOCAL_SNAPSHOT}")
+
+    cl = sqlite3.connect(COST_LOG_LOCAL_SNAPSHOT)
+    cl.row_factory = sqlite3.Row
+    notes_by_id = {r['id']: r['notes'] for r in cl.execute("SELECT id, notes FROM cost_log")}
+    cl.close()
+    log(f"cost_log entries available: {len(notes_by_id)}")
+
+    db = sqlite3.connect(ARGOS_DB, timeout=30); db.execute("PRAGMA busy_timeout=30000")
+    db.row_factory = sqlite3.Row
+    rows = list(db.execute(
+        "SELECT dispatch_id FROM dispatches "
+        "WHERE actual_input_tokens IS NULL OR actual_input_tokens = 0"
+    ))
+    log(f"dispatches missing tokens: {len(rows)}")
+
+    updated = 0
+    skipped = 0
+    for r in rows:
+        did = r['dispatch_id']
+        if not did or not did.startswith("costlog-"):
+            skipped += 1
+            continue
+        try:
+            cid = int(did[len("costlog-"):])
+        except ValueError:
+            skipped += 1
+            continue
+        notes = notes_by_id.get(cid)
+        tin, tout = parse_tokens(notes)
+        if tin is None and tout is None:
+            skipped += 1
+            continue
+        db.execute(
+            "UPDATE dispatches SET actual_input_tokens = ?, actual_output_tokens = ? "
+            "WHERE dispatch_id = ? AND (actual_input_tokens IS NULL OR actual_input_tokens = 0)",
+            (tin, tout, did)
+        )
+        updated += 1
+    db.commit()
+    db.close()
+
+    log(f"  tokens backfilled: {updated}")
+    log(f"  skipped (no match/unparseable): {skipped}")
+    log("=== argos token backfill done ===")
+
 def _label_new():
     """Derive accepted/quality labels for any newly-inserted dispatches."""
     if outcome_labeler is not None:
@@ -252,5 +347,8 @@ def _label_new():
             log(f"outcome labeling failed: {e}")
 
 if __name__ == "__main__":
-    main()
-    _label_new()
+    if "--backfill-tokens" in sys.argv:
+        backfill_tokens_from_notes()
+    else:
+        main()
+        _label_new()
