@@ -46,6 +46,24 @@ JUDGE_SAMPLES = 3            # N=3 judge calls per (task, output); per-criterion
 LATENCY_NEUTRAL_SCORE = 0.7  # latency-only / no-reference tasks: neutral pass (correctness skipped)
 PASS_THRESHOLD = 0.7         # judge score >= 0.7 counts as a success (binary outcome for SPRT)
 
+# --- Benchmark-score cache (CACHE-001) ----------------------------------------
+# A (model_id, task_id, JUDGE_MODEL) benchmark score is DETERMINISTIC given the
+# model version + judge, so re-running every task x N=3 against unchanged models
+# every week is wasted OpenRouter cost. cached_run_trial() memoises run_trial()'s
+# (success, score, latency) tuple in the bench_cache table.
+#
+# HONEST LIMITATION (do NOT pretend otherwise): OpenRouter model SLUGS are stable
+# strings, but the model BEHIND a slug can change silently -- there is NO reliable
+# per-call version/content hash exposed by the API. So invalidation is NOT content-
+# based. We invalidate on three honest signals only:
+#   1. TTL  -- re-run if the cached score is older than BENCH_CACHE_TTL_DAYS (the
+#              best available proxy for "the model behind the slug may have moved").
+#   2. force -- --force-rescore ignores the cache and refreshes every entry.
+#   3. judge -- JUDGE_MODEL is part of the cache key (U5 showed absolute scores
+#              shift by judge), so changing the pinned judge naturally misses the
+#              old rows and re-judges.
+BENCH_CACHE_TTL_DAYS = 30    # re-run a cached (model,task,judge) score older than this
+
 # SPRT params
 ALPHA, BETA = 0.05, 0.10
 H1_OFFSET = 0.08
@@ -277,6 +295,100 @@ def run_trial(model, task):
     except Exception as e:
         return 0, 0.0, int((time.time() - t0) * 1000)
 
+# === Benchmark-score cache (CACHE-001) ========================================
+def ensure_bench_cache(conn):
+    """Idempotently create the bench_cache table. judge_model is part of the PK
+    because U5 showed absolute scores shift by judge -- a cached score is only
+    valid for the exact judge model that produced it."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bench_cache ("
+        " model_id TEXT, task_id TEXT, judge_model TEXT,"
+        " success INT, score REAL, latency_ms INT, scored_at TEXT,"
+        " PRIMARY KEY (model_id, task_id, judge_model))")
+    conn.commit()
+
+def _age_days(scored_at):
+    """Age in days of an ISO scored_at timestamp vs now (UTC). Raises on garbage,
+    which callers treat as 'not fresh' / fall through to a re-run."""
+    dt = datetime.fromisoformat(scored_at)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+def cached_run_trial(conn, model, task, ttl_days=BENCH_CACHE_TTL_DAYS, force=False):
+    """run_trial() with a TTL'd benchmark-score cache keyed on
+    (model_id, task_id, JUDGE_MODEL).
+
+    Returns (success:int, score:float, latency_ms:int, cache_state:str) where
+    cache_state is one of {"hit","miss","stale"}. The first THREE elements are
+    byte-for-byte the same tuple shape run_trial() returns, so SPRT and the
+    bake_off_decisions writes are unaffected -- callers just ignore the 4th value.
+
+    HIT  -> fresh cached row (scored within ttl_days), same judge: returned WITHOUT
+            calling the model or judge.
+    MISS -> no cached row: live run_trial(), then cache the result.
+    STALE-> a row existed but is older than ttl_days (or force re-judges it): live
+            run_trial(), then refresh the cached row's scored_at to now.
+
+    Best-effort: ANY cache read/write error falls back to a live run_trial() and
+    NEVER raises -- the cache is a cost optimisation, not a correctness dependency.
+    """
+    task_id = task.get("id")
+    judge_model = JUDGE_MODEL   # read the module global at call time (judge swaps -> new key)
+
+    # --- read ---------------------------------------------------------------
+    row = None
+    try:
+        if task_id is not None:
+            row = conn.execute(
+                "SELECT success, score, latency_ms, scored_at FROM bench_cache "
+                "WHERE model_id=? AND task_id=? AND judge_model=?",
+                (model, task_id, judge_model)).fetchone()
+    except Exception:
+        row = None  # cache read failed -> treat as a miss, fall through to live run
+
+    if row is not None and not force:
+        try:
+            if _age_days(row[3]) < ttl_days:
+                # HIT: fresh + same judge -> no model/judge calls.
+                return int(row[0]), float(row[1]), int(row[2]), "hit"
+        except Exception:
+            pass  # unparseable timestamp -> treat as stale, re-run below
+        state = "stale"
+    elif force:
+        state = "stale" if row is not None else "miss"
+    else:
+        state = "miss"
+
+    # --- live run (MISS / STALE / force) ------------------------------------
+    success, score, lat = run_trial(model, task)
+
+    # --- write (best-effort UPSERT; PK replace) -----------------------------
+    try:
+        if task_id is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO bench_cache "
+                "(model_id, task_id, judge_model, success, score, latency_ms, scored_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (model, task_id, judge_model, int(success), float(score), int(lat), now_iso()))
+            conn.commit()
+    except Exception:
+        pass  # cache write failed -> result is still valid, just not memoised
+
+    return success, score, lat, state
+
+def bench_cache_stats(conn, ttl_days=BENCH_CACHE_TTL_DAYS):
+    """(total_entries, stale_entries) currently in bench_cache."""
+    total = conn.execute("SELECT COUNT(*) FROM bench_cache").fetchone()[0]
+    stale = 0
+    for (sa,) in conn.execute("SELECT scored_at FROM bench_cache"):
+        try:
+            if _age_days(sa) >= ttl_days:
+                stale += 1
+        except Exception:
+            stale += 1  # unparseable -> count as stale (would be re-run)
+    return total, stale
+
 def sprt_step(log_lr, x, p0, p1):
     """Update log-likelihood-ratio with one Bernoulli outcome x."""
     if x:
@@ -299,6 +411,13 @@ def main():
     ap.add_argument("--classes", default="")
     ap.add_argument("--champion", default="deepseek/deepseek-chat")
     ap.add_argument("--challenger", default="openai/gpt-oss-120b:free")
+    # CACHE-001: benchmark-score cache controls
+    ap.add_argument("--force-rescore", action="store_true",
+                    help="ignore the bench_cache and re-run + refresh every (model,task,judge) score")
+    ap.add_argument("--cache-ttl-days", type=int, default=BENCH_CACHE_TTL_DAYS,
+                    help=f"re-run a cached score older than N days (default {BENCH_CACHE_TTL_DAYS})")
+    ap.add_argument("--cache-stats", action="store_true",
+                    help="print bench_cache entry/stale counts and exit")
     args = ap.parse_args()
 
     tasks = json.load(open(args.tasks))
@@ -309,6 +428,13 @@ def main():
     classes = args.classes.split(",") if args.classes else list(by_class.keys())
     conn = sqlite3.connect(args.db, timeout=30)
     conn.execute("PRAGMA busy_timeout=30000")
+    ensure_bench_cache(conn)  # CACHE-001: idempotent table create
+
+    if args.cache_stats:
+        total, stale = bench_cache_stats(conn, ttl_days=args.cache_ttl_days)
+        print(f"bench_cache: {total} (model,task,judge) entries, {stale} stale "
+              f"(>{args.cache_ttl_days}d) -> would re-run on next eval")
+        return
 
     round_id = conn.execute(
         "INSERT INTO bake_off_rounds (task_class, sample_size, status, started_at, created_at) "
@@ -320,6 +446,7 @@ def main():
     print(f"SPRT boundaries: promote>={LOG_A:.3f} reject<={LOG_B:.3f}")
 
     summary = []
+    cache_stats = {"hit": 0, "miss": 0, "stale": 0}  # CACHE-001: round-level tally
     for cls in classes:
         ctasks = by_class.get(cls, [])
         if not ctasks:
@@ -346,9 +473,13 @@ def main():
         ti = 0
         while n < args.max_trials and decision == "continue":
             task = ctasks[ti % len(ctasks)]; ti += 1
-            # Run both arms on the same task
-            c_ok, c_score, c_lat = run_trial(args.champion, task)
-            h_ok, h_score, h_lat = run_trial(args.challenger, task)
+            # Run both arms on the same task (CACHE-001: cached_run_trial returns the
+            # identical (success, score, latency) tuple shape + a cache_state we tally).
+            c_ok, c_score, c_lat, c_cs = cached_run_trial(
+                conn, args.champion, task, ttl_days=args.cache_ttl_days, force=args.force_rescore)
+            h_ok, h_score, h_lat, h_cs = cached_run_trial(
+                conn, args.challenger, task, ttl_days=args.cache_ttl_days, force=args.force_rescore)
+            cache_stats[c_cs] += 1; cache_stats[h_cs] += 1
             champ_succ += c_ok; chal_succ += h_ok
             # SPRT tracks the CHALLENGER's success stream vs p0/p1
             log_lr = sprt_step(log_lr, h_ok, p0, p1)
@@ -406,6 +537,11 @@ def main():
     conn.execute("UPDATE bake_off_rounds SET status=?, completed_at=? WHERE round_id=?",
                  ("complete" + ("-dryrun" if args.dry_run else ""), now_iso(), round_id))
     conn.commit()
+    # CACHE-001: per-round cache summary. Each HIT avoids one model call + JUDGE_SAMPLES
+    # judge calls (~1 + N OpenRouter calls saved per hit).
+    saved = cache_stats["hit"] * (1 + JUDGE_SAMPLES)
+    print(f"cache: {cache_stats['hit']} hits, {cache_stats['miss']} miss, "
+          f"{cache_stats['stale']} stale - saved ~{saved} judge calls")
     print(f"\nround {round_id} complete. summary:")
     for cls, n, cs, hs, dec in summary:
         print(f"  {cls}: {dec} (champ {cs}/{n}, chal {hs}/{n})")
