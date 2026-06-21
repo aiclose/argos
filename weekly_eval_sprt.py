@@ -26,7 +26,24 @@ from datetime import datetime, timezone
 
 OR_KEY = os.getenv("OPENROUTER_API_KEY")  # env-only, no hardcoded secret
 OR_URL = "https://openrouter.ai/api/v1/chat/completions"
-JUDGE_MODEL = "openai/gpt-oss-120b:free"
+
+# --- LLM-judge config (U5-001) -------------------------------------------------
+# Pinned, trivially-swappable judge model. Default is a STRONG, cheap, fast model
+# (good for a weekly job). Swap by editing this one constant. Verified-live options:
+#   "google/gemini-2.5-flash"  -> default  (strong / cheap / fast)
+#   "google/gemini-2.5-pro"    -> higher-rigor option (strongest, slower/pricier)
+#   "deepseek/deepseek-v3.2"   -> alt strong
+#   "qwen/qwen3-coder-plus"    -> alt strong (code-leaning)
+#   "openai/gpt-oss-120b:free" -> OLD default; weak / DRACO-gameable (do NOT use)
+#   grok-4 is DEPRECATED -> do NOT use.
+#
+# DRACO CAVEAT: absolute judge scores shift ~10-25 points depending on which judge
+# model you pin. Trust the RELATIVE ranking between champion and challenger, NOT the
+# absolute value. Pinning ONE judge model keeps every comparison within a single
+# bake-off consistent, so the relative ordering stays meaningful.
+JUDGE_MODEL = "google/gemini-2.5-flash"
+JUDGE_SAMPLES = 3            # N=3 judge calls per (task, output); per-criterion mean -> weighted final
+LATENCY_NEUTRAL_SCORE = 0.7  # latency-only / no-reference tasks: neutral pass (correctness skipped)
 PASS_THRESHOLD = 0.7         # judge score >= 0.7 counts as a success (binary outcome for SPRT)
 
 # SPRT params
@@ -38,9 +55,9 @@ LOG_B = math.log(BETA / (1 - ALPHA))   # ~-1.56 (reject boundary)
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def or_chat(model, prompt, max_tokens=600, timeout=90):
+def or_chat(model, prompt, max_tokens=600, timeout=90, temperature=0.2):
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
-                       "max_tokens": max_tokens, "temperature": 0.2}).encode()
+                       "max_tokens": max_tokens, "temperature": temperature}).encode()
     req = urllib.request.Request(OR_URL, data=body,
         headers={"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -49,24 +66,205 @@ def or_chat(model, prompt, max_tokens=600, timeout=90):
         usage = d.get("usage", {})
         return (m.get("content") or m.get("reasoning") or ""), usage
 
-def judge(task, output, timeout=90):
-    """LLM-judge score 0.0-1.0 against the task rubric."""
-    prompt = f"""Score this answer 0.0 to 1.0 against the rubric. Reply ONLY a number.
+# === LLM-judge (U5-001) =======================================================
+# DRACO-shaped weighted per-criterion judge with negative (confident-wrong)
+# criteria, N=3 sampling, and a pinned swappable judge model (see JUDGE_MODEL).
+import re as _re
 
-TASK: {task['prompt'][:1500]}
-RUBRIC: {task.get('rubric','correctness')}
-EXPECTED: {str(task.get('expected',''))[:500]}
-
-ANSWER:
-{output[:2500]}
-
-Score (0.0-1.0):"""
-    txt, _ = or_chat(JUDGE_MODEL, prompt, max_tokens=20, timeout=timeout)
-    import re
-    m = re.search(r"(\d*\.?\d+)", txt)
-    if not m:
+def _clamp(x):
+    """Coerce to a float in [0,1]; NaN/None/garbage -> 0.0."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
         return 0.0
-    return max(0.0, min(1.0, float(m.group(1))))
+    if x != x:  # NaN
+        return 0.0
+    return max(0.0, min(1.0, x))
+
+def parse_rubric(rubric):
+    """Parse a task rubric into a normalised [(criterion, weight), ...] list.
+
+    Handles BOTH on-disk formats:
+      (a) space-separated string  "code-correctness:0.6 docstring:0.15 style:0.1"
+      (b) JSON dict               {"code-correctness":0.6, "style":0.15, ...}
+          (also a dict handed in as a JSON string).
+    Weights are normalised defensively to sum to 1.0 (they are only INTENDED to
+    sum ~1.0 on disk). Degenerate input -- empty, unparseable, or total weight
+    <= 0 -- falls back to [("correctness", 1.0)].
+    """
+    pairs = []
+    if isinstance(rubric, dict):
+        for k, v in rubric.items():
+            try:
+                pairs.append((str(k).strip(), float(v)))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(rubric, str):
+        s = rubric.strip()
+        if s.startswith("{"):                 # tolerate a JSON object passed as a string
+            try:
+                d = json.loads(s)
+                if isinstance(d, dict):
+                    return parse_rubric(d)
+            except Exception:
+                pass
+        for tok in s.split():
+            if ":" in tok:
+                name, _, w = tok.rpartition(":")
+                try:
+                    pairs.append((name.strip(), float(w)))
+                except ValueError:
+                    continue
+    # keep only named, positive, non-NaN weights
+    pairs = [(c, w) for c, w in pairs if c and w > 0 and w == w]
+    total = sum(w for _, w in pairs)
+    if not pairs or total <= 0:
+        return [("correctness", 1.0)]
+    return [(c, w / total) for c, w in pairs]
+
+def _is_latency_only(criteria):
+    """True when every criterion is a latency criterion (no correctness to grade)."""
+    return bool(criteria) and all("latency" in c.lower() for c, _ in criteria)
+
+def _judge_prompt(task, output, criteria):
+    """Build the DRACO-shaped weighted per-criterion judge prompt."""
+    crit_lines = "\n".join(f'  - "{c}" (weight {w:.2f})' for c, w in criteria)
+    example = "{" + ", ".join(f'"{c}": 0.0' for c, _ in criteria) + "}"
+    return f"""You are a STRICT, SKEPTICAL grader. Grade the ANSWER against each weighted
+rubric criterion below, comparing it to the EXPECTED reference answer.
+Score EACH criterion from 0.0 (fails completely) to 1.0 (fully satisfies it).
+
+NEGATIVE / CONFIDENT-WRONG RULES (apply strictly -- this is the point of the grade):
+  - A confidently INCORRECT answer must score LOWER than an answer that is honestly
+    unsure, hedged, or only partially correct. Confident wrongness is the WORST outcome.
+  - Penalise HARDEST on the correctness criteria for hallucinated specifics: made-up
+    function names, fabricated values, invented APIs, or any claim NOT supported by the
+    EXPECTED reference answer.
+  - Do NOT reward fluent, authoritative prose that is factually wrong.
+  - An answer that admits uncertainty but is partially correct scores HIGHER than a
+    polished answer that is wrong.
+
+CRITERIA (each scored 0.0-1.0):
+{crit_lines}
+
+TASK:
+{str(task.get('prompt',''))[:1500]}
+
+EXPECTED (reference answer):
+{str(task.get('expected',''))[:800]}
+
+ANSWER (to grade):
+{str(output)[:2500]}
+
+Return STRICT JSON ONLY: an object mapping EACH criterion name above to its score, e.g.
+{example}
+Output ONLY the JSON object -- no prose, no markdown fences."""
+
+def _extract_json_obj(txt):
+    """Tolerant: return the first JSON object found in txt, else None."""
+    try:
+        v = json.loads(txt)
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
+    m = _re.search(r"\{.*\}", txt, _re.DOTALL)
+    if m:
+        try:
+            v = json.loads(m.group(0))
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+    return None
+
+def _sample_score(txt, criteria):
+    """Score ONE judge response. Returns (weighted_score_float, per_criterion_dict).
+
+    Robustness ladder: strict/tolerant JSON object of per-criterion scores ->
+    weighted sum; else fall back to a single number applied to all criteria;
+    else 0.0. Never raises.
+    """
+    obj = _extract_json_obj(txt)
+    per = {}
+    if obj is not None:
+        for c, _ in criteria:
+            if c in obj:
+                per[c] = _clamp(obj[c])
+    if per:
+        # partial JSON: fill any unscored criteria with the mean of scored ones
+        # (neutral) rather than zeroing them out.
+        if len(per) < len(criteria):
+            fill = sum(per.values()) / len(per)
+            for c, _ in criteria:
+                per.setdefault(c, fill)
+        score = sum(per[c] * w for c, w in criteria)
+        return _clamp(score), per
+    # tolerant fallback: a bare number anywhere in the text
+    m = _re.search(r"(\d*\.?\d+)", txt or "")
+    if m:
+        n = _clamp(m.group(1))
+        return n, {c: n for c, _ in criteria}
+    return 0.0, {c: 0.0 for c, _ in criteria}
+
+def judge_detailed(task, output, timeout=90):
+    """DRACO-shaped weighted judge with N=JUDGE_SAMPLES sampling.
+
+    Returns a dict for transparency/logging:
+      {"score": float, "per_criterion": {crit: mean_score}, "samples": [final,...],
+       "variance": float, "n_samples": int, "note": str (optional)}
+
+    AGGREGATION (documented): each of the N samples is scored per-criterion; we take
+    the per-criterion MEAN across samples, THEN the weighted sum -> final "score".
+    "variance" is the population variance of the per-sample weighted finals (an
+    agreement signal -- low variance == the judge samples agreed).
+    """
+    criteria = parse_rubric(task.get("rubric"))
+    # latency-only / no reference answer -> nothing to grade for correctness.
+    if task.get("expected") is None or _is_latency_only(criteria):
+        return {"score": LATENCY_NEUTRAL_SCORE,
+                "per_criterion": {c: LATENCY_NEUTRAL_SCORE for c, _ in criteria},
+                "samples": [], "variance": 0.0, "n_samples": 0,
+                "note": "latency-only/no-reference: neutral pass (correctness skipped)"}
+
+    prompt = _judge_prompt(task, output, criteria)
+    sample_finals, sample_pers = [], []
+    for _ in range(JUDGE_SAMPLES):
+        try:
+            # temperature ~0.3 so the N samples genuinely vary.
+            txt, _u = or_chat(JUDGE_MODEL, prompt, max_tokens=300,
+                              timeout=timeout, temperature=0.3)
+        except Exception:
+            continue
+        s, per = _sample_score(txt, criteria)
+        sample_finals.append(s)
+        sample_pers.append(per)
+
+    if not sample_finals:
+        return {"score": 0.0, "per_criterion": {}, "samples": [], "variance": 0.0,
+                "n_samples": 0, "note": "no judge samples (all calls failed)"}
+
+    per_mean = {}
+    for c, _ in criteria:
+        vals = [p[c] for p in sample_pers if c in p]
+        per_mean[c] = sum(vals) / len(vals) if vals else 0.0
+    final = _clamp(sum(per_mean[c] * w for c, w in criteria))
+    mean_final = sum(sample_finals) / len(sample_finals)
+    variance = sum((s - mean_final) ** 2 for s in sample_finals) / len(sample_finals)
+    return {"score": final, "per_criterion": per_mean, "samples": sample_finals,
+            "variance": variance, "n_samples": len(sample_finals)}
+
+def judge(task, output, timeout=90):
+    """LLM-judge score 0.0-1.0 against the task rubric (run_trial's contract).
+
+    Backward compatible: returns a single float in [0,1]. Defensive: never raises
+    out into run_trial -- any failure collapses to 0.0. Use judge_detailed() for
+    the per-criterion breakdown / sample variance.
+    """
+    try:
+        return _clamp(judge_detailed(task, output, timeout=timeout)["score"])
+    except Exception:
+        return 0.0
 
 def run_trial(model, task):
     """Run one task against one model, return (success_bool, score, latency_ms)."""
