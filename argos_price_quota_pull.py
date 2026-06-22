@@ -17,8 +17,17 @@ c=sqlite3.connect(DB)
 upd=0
 for m in models:
     mid=m["id"]; pr=m.get("pricing",{}) or {}
-    try: inp=float(pr.get("prompt") or 0)*1_000_000; out=float(pr.get("completion") or 0)*1_000_000
-    except: inp=out=0.0
+    # OpenRouter variable-price meta-models (auto/fusion/etc) report price "-1"; any
+    # negative is "unknown/variable", NOT free. Clamp to a conservative p90 upper bound
+    # (input $3 / output $15 per 1M) so they stay routable but never look cheapest. CHG-P9-047.
+    EST_IN_PER_1M, EST_OUT_PER_1M = 3.0, 15.0
+    try:
+        inp=float(pr.get("prompt") or 0)*1_000_000
+        out=float(pr.get("completion") or 0)*1_000_000
+    except (TypeError, ValueError):
+        inp=out=0.0
+    if inp < 0: inp = EST_IN_PER_1M
+    if out < 0: out = EST_OUT_PER_1M
     tp=m.get("top_provider",{}) or {}
     c.execute("""INSERT INTO model_prices(model_id,provider,input_per_1m_usd,output_per_1m_usd,context_window,max_output_tokens,last_fetched_at,raw_json,deprecated)
                  VALUES(?,?,?,?,?,?,?,?,0)
