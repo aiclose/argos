@@ -36,6 +36,30 @@ MAX_CAPACITY_COST = 100.0        # hard clamp on the >100%% "sting". The convex 
 DEFAULT_EST_INPUT = 4000  # fallback token estimates if task omits them
 DEFAULT_EST_OUTPUT = 1500
 
+# --- offline-replay injection hooks (CHG-P9-050) ---
+# These are PROCESS-LOCAL and default None. The LIVE path (router.py ->
+# select_route -> effective_cost) never imports or sets them, so its behaviour is
+# byte-for-byte unchanged: every branch below is None-guarded and falls through to
+# the existing quota_caps/quota_usage DB reads. They exist so the single-threaded
+# shadow replay can (a) inject an in-memory per-(bucket,day) usage snapshot instead
+# of reading today's live quota_usage, and (b) substitute a notional daily_requests
+# cap for a --codex-cap sensitivity sweep - WITHOUT touching the live DB or the
+# select_route signature. There is no concurrency hazard: the replay is one thread.
+_BUCKET_USAGE_OVERRIDE = None   # None -> read quota_usage (live). Else {bucket: (req, tok, cost)}.
+_BUCKET_CAP_OVERRIDE = None     # None -> read quota_caps (live). Else {bucket: daily_requests_cap}.
+
+
+def set_bucket_usage_override(d):
+    """Set (or clear with None) the process-local usage snapshot. Replay-only."""
+    global _BUCKET_USAGE_OVERRIDE
+    _BUCKET_USAGE_OVERRIDE = d
+
+
+def set_bucket_cap_override(d):
+    """Set (or clear with None) the process-local daily_requests_cap map. Replay-only."""
+    global _BUCKET_CAP_OVERRIDE
+    _BUCKET_CAP_OVERRIDE = d
+
 
 @dataclass
 class Task:
@@ -92,14 +116,26 @@ def _bucket_quota_cost(con, route, eta):
     cap = con.execute(
         "SELECT daily_requests_cap, daily_tokens_cap, daily_cost_cap_usd "
         "FROM quota_caps WHERE bucket=?", (bucket,)).fetchone()
+    # CHG-P9-050 (replay-only, None in production): substitute a notional
+    # daily_requests cap for this bucket. None-guarded -> live reads cap verbatim.
+    # Lets a flat-rate bucket whose DB caps are all NULL still ration in a sweep.
+    if _BUCKET_CAP_OVERRIDE is not None and bucket in _BUCKET_CAP_OVERRIDE:
+        cap = (_BUCKET_CAP_OVERRIDE[bucket],
+               cap[1] if cap else None,
+               cap[2] if cap else None)
     if not cap:
         return 0.0
-    import time as _t
-    day = _t.strftime("%Y-%m-%d")  # matches the ledger writer (_augment_dispatch)
-    use = con.execute(
-        "SELECT requests, input_tokens + output_tokens, cost_usd "
-        "FROM quota_usage WHERE bucket=? AND day=?", (bucket, day)).fetchone()
-    used_req, used_tok, used_cost = (use or (0, 0, 0.0))
+    # CHG-P9-050 (replay-only, None in production): source usage from the
+    # injected in-memory snapshot. None-guarded -> live reads today's quota_usage.
+    if _BUCKET_USAGE_OVERRIDE is not None:
+        used_req, used_tok, used_cost = _BUCKET_USAGE_OVERRIDE.get(bucket, (0, 0, 0.0))
+    else:
+        import time as _t
+        day = _t.strftime("%Y-%m-%d")  # matches the ledger writer (_augment_dispatch)
+        use = con.execute(
+            "SELECT requests, input_tokens + output_tokens, cost_usd "
+            "FROM quota_usage WHERE bucket=? AND day=?", (bucket, day)).fetchone()
+        used_req, used_tok, used_cost = (use or (0, 0, 0.0))
     worst = 0.0
     for cap_v, used_v in ((cap[0], used_req), (cap[1], used_tok), (cap[2], used_cost)):
         if not cap_v or cap_v <= 0:
