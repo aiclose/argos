@@ -106,29 +106,19 @@ def fetch_new_cost_log_entries(last_id):
     db.close()
     return [dict(r) for r in rows]
 
-def classify_batch(items, classes_str, litellm_key):
-    """Send batch to Haiku, get list of class_ids back."""
-    items_text = "\n".join([
-        f"{i+1}. [{x['tag']}] {x.get('notes') or '(no notes)'}"
-        for i, x in enumerate(items)
-    ])
-    prompt = f"""Classify each homelab task into one of these classes:
+def _haiku_classify(prompt, system, litellm_key, max_tokens=500):
+    """Single Haiku(LiteLLM) classification call - the shared HTTP/auth/fence-strip
+    seam behind BOTH classify_batch (JSON-array) and classify_one (single class_id).
 
-{classes_str}
-
-Tasks to classify:
-{items_text}
-
-Respond with ONLY a JSON array of class_ids in order, one per task. No prose.
-Example: ["devops", "testing", ...]
-"""
+    Returns (content, usage) with any ```-fence stripped from content, or (None, None)
+    on any error. Behaviour is byte-for-byte what classify_batch used to do inline."""
     body = json.dumps({
         "model": "claude-haiku",
         "messages": [
-            {"role": "system", "content": "You are a task classifier. Respond ONLY with a JSON array."},
+            {"role": "system", "content": system},
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 500,
+        "max_tokens": max_tokens,
         "temperature": 0.0,
     }).encode()
     req = urllib.request.Request(
@@ -145,10 +135,70 @@ Example: ["devops", "testing", ...]
             if content.startswith("json"):
                 content = content[4:]
             content = content.strip()
-        return json.loads(content), resp.get("usage", {})
+        return content, resp.get("usage", {})
     except Exception as e:
         log(f"  classify error: {e}")
         return None, None
+
+
+def classify_batch(items, classes_str, litellm_key):
+    """Send batch to Haiku, get list of class_ids back."""
+    items_text = "\n".join([
+        f"{i+1}. [{x['tag']}] {x.get('notes') or '(no notes)'}"
+        for i, x in enumerate(items)
+    ])
+    prompt = f"""Classify each homelab task into one of these classes:
+
+{classes_str}
+
+Tasks to classify:
+{items_text}
+
+Respond with ONLY a JSON array of class_ids in order, one per task. No prose.
+Example: ["devops", "testing", ...]
+"""
+    content, usage = _haiku_classify(
+        prompt, "You are a task classifier. Respond ONLY with a JSON array.", litellm_key)
+    if content is None:
+        return None, None
+    try:
+        return json.loads(content), usage
+    except Exception as e:
+        log(f"  classify parse error: {e}")
+        return None, None
+
+
+def classify_one(task_text, classes_str, litellm_key):
+    """Classify a SINGLE free-text task into one class_id from the taxonomy.
+
+    Reusable seam for /classify-and-route: the langgraph-spine hands Argos raw task
+    text and has NO task_class at its injection point. Shares the exact HTTP/auth/
+    fence-strip path with classify_batch via _haiku_classify, so the two never drift.
+    Returns the class_id string, or None on any error (caller decides the fallback)."""
+    prompt = f"""Classify this task into exactly one of these classes:
+
+{classes_str}
+
+Task to classify:
+{task_text}
+
+Respond with ONLY the single class_id (e.g. devops). No prose, no quotes, no JSON."""
+    content, _usage = _haiku_classify(
+        prompt, "You are a task classifier. Respond ONLY with a single class_id.", litellm_key)
+    if content is None:
+        return None
+    cls = content.strip().strip('`').strip().strip('"').strip("'").strip()
+    # Tolerate a model that still answers with a JSON array/string.
+    if cls.startswith("["):
+        try:
+            arr = json.loads(cls)
+            if arr:
+                cls = str(arr[0]).strip()
+        except Exception:
+            pass
+    # Keep only the first token if the model added stray words after the id.
+    parts = cls.split()
+    return (parts[0] if parts else cls) or None
 
 def call_argos_route(tag, task_class):
     # Payload already matches TaskRequest, which /route-v2 also consumes - keep as-is.
