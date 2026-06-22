@@ -71,6 +71,15 @@ def reconcile_routes(db, seen_ids):
     Behaviour / guarantees:
       - NEVER touches routes with model_id IS NULL: those are non-OpenRouter
         backends (codex-cli, claude-code, ...) and have no OpenRouter model to check.
+      - NEVER touches spine:litellm routes (tool='litellm' OR access_path='litellm').
+        Their model_id is a LiteLLM ALIAS (claude-haiku, deepseek-v3, ...), not an
+        OpenRouter slug, so a slug-presence test would WRONGLY disable all of them.
+        Spine liveness is owned by route_health (path-native LiteLLM probe) and the
+        route_select path-native gate -- a dead alias is excluded by the gate via
+        last_health, NOT auto-disabled here. See reconcile_spine_routes() + ARGOS-S1.
+        (NULL-safe: tool/access_path may be NULL on genuine OpenRouter routes, and
+        `NULL != 'litellm'` is NULL in SQL, so those are kept via the IS NULL arm --
+        forge reconciliation stays byte-identical.)
       - REACTIVATION GUARD: only ever flips enabled 1 -> 0, NEVER 0 -> 1. If a
         model reappears on OpenRouter a human must re-enable the route deliberately;
         auto-re-enabling could resurrect a route the operator disabled for other
@@ -92,10 +101,14 @@ def reconcile_routes(db, seen_ids):
         "SELECT model_id FROM model_prices WHERE deprecated = 0"
     )}
 
-    # Only currently-enabled, OpenRouter-backed routes are candidates.
+    # Only currently-enabled, genuinely OpenRouter-backed routes are candidates.
+    # Spine:litellm routes are excluded (their model_id is a LiteLLM alias, not a
+    # slug); NULL-safe so OpenRouter routes with NULL tool/access_path stay in.
     rows = db.execute("""
         SELECT route_id, model_id, notes FROM routes
         WHERE model_id IS NOT NULL AND enabled = 1
+          AND (tool IS NULL OR tool != 'litellm')
+          AND (access_path IS NULL OR access_path != 'litellm')
     """).fetchall()
 
     for row in rows:
@@ -111,6 +124,32 @@ def reconcile_routes(db, seen_ids):
         disabled.append((row["route_id"], mid))
 
     return disabled
+
+def reconcile_spine_routes(db):
+    """Spine-liveness reporting pass for spine:litellm routes. INTENTIONALLY a
+    NO-OP on the enabled flag.
+
+    Why this exists and why it never disables:
+      Spine routes dispatch via LiteLLM, so their liveness is "does the LiteLLM
+      alias resolve", NOT "is an OpenRouter slug present in the catalogue". The
+      OpenRouter pricing puller has no authority over that signal, so it must not
+      auto-disable spine routes (that was the route-kill bug ARGOS-S1 fixes).
+      Live probing is owned by route_health (path-native LiteLLM check, which
+      writes last_health) and a dead alias is then excluded by the route_select
+      path-native gate (last_health != 'ok'). This pass only REPORTS the health
+      the probe last recorded; it changes no rows.
+
+    Returns a list of (route_id, model_id, last_health) for logging/visibility.
+    Tolerates an older routes table without a last_health column.
+    """
+    cols = {r[1] for r in db.execute("PRAGMA table_info(routes)")}
+    health_col = "last_health" if "last_health" in cols else "NULL AS last_health"
+    rows = db.execute(f"""
+        SELECT route_id, model_id, {health_col} FROM routes
+        WHERE enabled = 1
+          AND (tool = 'litellm' OR access_path = 'litellm')
+    """).fetchall()
+    return [(r["route_id"], r["model_id"], r["last_health"]) for r in rows]
 
 def main():
     log("=== pricing puller start ===", also_stdout=True)
@@ -200,6 +239,14 @@ def main():
     except Exception as e:
         log(f"  route reconciliation failed (non-fatal): {e}")
 
+    # Spine:litellm liveness is owned by route_health + the path-native gate, NOT
+    # the OpenRouter slug reconciler. Report-only, never disables. Best-effort.
+    spine_routes = []
+    try:
+        spine_routes = reconcile_spine_routes(db)
+    except Exception as e:
+        log(f"  spine route reconciliation failed (non-fatal): {e}")
+
     db.commit()
     db.close()
 
@@ -207,6 +254,10 @@ def main():
     log(f"  {new_count} new, {updated_count} significant price changes")
     log(f"  {deprecated_count} marked deprecated (no longer on OpenRouter)")
     log(f"  {len(disabled_routes)} routes auto-disabled (model deprecated/absent)")
+    if spine_routes:
+        ok = sum(1 for _, _, h in spine_routes if h == "ok")
+        log(f"  {len(spine_routes)} spine:litellm routes (report-only, never auto-disabled here): "
+            f"{ok} last_health=ok, liveness owned by route_health/gate")
     if disabled_routes:
         for rid, mid in disabled_routes:
             log(f"    disabled route {rid} -> {mid}")

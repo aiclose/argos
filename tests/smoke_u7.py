@@ -56,7 +56,9 @@ def build_db():
             model_id TEXT,
             enabled INTEGER,
             notes TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            tool TEXT,
+            access_path TEXT
         )
     """)
 
