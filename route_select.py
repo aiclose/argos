@@ -424,9 +424,20 @@ def _predicted_success(con, route, task: RouteTask, floor: float) -> tuple[float
     return base, None
 
 
-def _route_is_cli_smoke_healthy(route) -> bool:
-    """Locked decision #11573: only path-native cli-smoke ok is healthy."""
-    return route["healthcheck_type"] == "cli-smoke" and route["last_health"] == "ok"
+def _route_is_path_native_healthy(route) -> bool:
+    """Locked decision #11573: a route counts as healthy only when validated via
+    its OWN access path, never a proxy. cli-smoke was the proxy for path-native
+    when spine routes did not exist.
+
+    Extended per ARGOS-CH4 (LiteLLM-verified spine routes): api-chat health now
+    means the spine route was probed over its own LiteLLM access path. So a route
+    is healthy when its path-native check passed:
+      - cli-smoke (Forge CLI lane)  AND last_health == 'ok', OR
+      - api-chat  (LiteLLM/spine)   AND last_health == 'ok'.
+    NULL last_health is NEVER healthy (route not yet probed).
+    """
+    ht = route["healthcheck_type"]
+    return ht in ("cli-smoke", "api-chat") and route["last_health"] == "ok"
 
 
 def _route_quota_ok(con, route, route_cols: set[str]) -> bool:
@@ -561,7 +572,7 @@ def select_route(task: RouteTask) -> RoutePlan:
             if r["backend"] != gate.backend:
                 excluded["backend"] += 1
                 continue
-            if not _route_is_cli_smoke_healthy(r):
+            if not _route_is_path_native_healthy(r):
                 excluded["health"] += 1
                 continue
             if not _route_quota_ok(con, r, route_cols):
@@ -586,7 +597,7 @@ def select_route(task: RouteTask) -> RoutePlan:
                 err = {"code": "no_spine_route_available", "message": "no spine route available"}
                 rationale = (
                     f"backend={gate.backend} reason={gate.reason} | "
-                    f"health_key=healthcheck_type:cli-smoke,last_health:ok | "
+                    f"health_key=path-native(cli-smoke|api-chat),last_health:ok | "
                     f"excluded={excluded} | no spine route available"
                 )
                 return RoutePlan(None, None, None, 0.0, floor, 0.0, False, [], 0,
@@ -594,7 +605,7 @@ def select_route(task: RouteTask) -> RoutePlan:
             err = {"code": "no_healthy_route", "message": f"no healthy {gate.backend} route available"}
             rationale = (
                 f"backend={gate.backend} reason={gate.reason} | "
-                f"health_key=healthcheck_type:cli-smoke,last_health:ok | excluded={excluded}"
+                f"health_key=path-native(cli-smoke|api-chat),last_health:ok | excluded={excluded}"
             )
             return RoutePlan(None, None, None, 0.0, floor, 0.0, False, [], 0,
                              rationale, gate.backend, gate.reason, 0.0, err)
@@ -623,7 +634,7 @@ def select_route(task: RouteTask) -> RoutePlan:
             rationale = (
                 f"backend={gate.backend} reason={gate.reason} | floor={floor:.2f} | "
                 f"strategy=within-backend-weighted-argmax | "
-                f"health_key=healthcheck_type:cli-smoke,last_health:ok | "
+                f"health_key=path-native(cli-smoke|api-chat),last_health:ok | "
                 f"candidates={len(candidates)} excluded={excluded} | "
                 f"best={best['route_id']} score={best['score']:.3f} psucc={best['psucc']:.2f} floor_fail"
             )
@@ -635,7 +646,7 @@ def select_route(task: RouteTask) -> RoutePlan:
         rationale = (
             f"backend={gate.backend} reason={gate.reason} | task_class={task.task_class} | "
             f"floor={floor:.2f} | strategy=within-backend-weighted-argmax | "
-            f"weights={dict(weights)} | health_key=healthcheck_type:cli-smoke,last_health:ok | "
+            f"weights={dict(weights)} | health_key=path-native(cli-smoke|api-chat),last_health:ok | "
             f"candidates={len(candidates)} excluded={excluded} | "
             f"picked {best['route_id']} score={best['score']:.3f} "
             f"eff=${best['eff']:.6f} psucc={best['psucc']:.2f}"
