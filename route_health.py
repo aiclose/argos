@@ -19,6 +19,17 @@ WORKER = os.getenv("FORGE_WORKER", "forge-worker")
 ACPC = os.getenv("FORGE_ACPC", "close@192.168.4.30")
 OR_KEY = os.getenv("OPENROUTER_API_KEY")  # only for api-chat (Janus) checks
 
+# LiteLLM (spine backend) path-native health. Spine routes dispatch via LiteLLM
+# (UM780:4000), NOT OpenRouter directly, so their model_id is a LiteLLM alias
+# (e.g. claude-haiku, deepseek-v3) and must be probed against LiteLLM, not the
+# OpenRouter slug API. See ARGOS-CH4 / ARGOS-S1.
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://127.0.0.1:4000")
+LITELLM_KEY = os.getenv("LITELLM_KEY")  # may be filled from the fallback below
+LITELLM_TIMEOUT_S = 45  # some local-backed aliases (qwen2.5-14b) take ~30s cold; >=40s required
+# Spine itself calls LiteLLM with the master key kept in /home/andy/docker/.env on
+# UM780 (NOT in argos/.env). Fall back to it so this check works when run on UM780.
+_DOCKER_ENVF = "/home/andy/docker/.env"
+
 # load env from argos/.env if present (key propagation fix)
 _envf = "/home/andy/argos/.env"
 if os.path.exists(_envf):
@@ -31,6 +42,51 @@ if os.path.exists(_envf):
                 OR_KEY = os.environ["OPENROUTER_API_KEY"]
 
 SMOKE_PROMPT = "Reply with exactly: OK"
+
+
+def _litellm_key():
+    """Resolve the LiteLLM bearer key.
+
+    Order: LITELLM_KEY env -> LITELLM_MASTER_KEY env -> LITELLM_MASTER_KEY in
+    /home/andy/docker/.env (the on-UM780 fallback, where spine reads it from).
+    """
+    key = LITELLM_KEY or os.getenv("LITELLM_MASTER_KEY")
+    if key:
+        return key
+    if os.path.exists(_DOCKER_ENVF):
+        try:
+            for _l in open(_DOCKER_ENVF):
+                _l = _l.strip()
+                if _l.startswith("LITELLM_MASTER_KEY=") and "=" in _l:
+                    return _l.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            return None
+    return None
+
+
+def litellm_chat(route):
+    """Call the route's OWN access path: LiteLLM /v1/chat/completions. Path-native
+    for spine:litellm routes whose model_id is a LiteLLM alias (NOT an OpenRouter
+    slug). Success = HTTP 200 AND non-empty content. Returns the same
+    (status, ms, sample) shape as the other checks."""
+    import urllib.request
+    model = route["model_id"]
+    key = _litellm_key()
+    if not key or not model:
+        return ("no-key-or-model", 0, "")
+    body = json.dumps({"model": model, "messages":[{"role":"user","content":SMOKE_PROMPT}],
+                       "max_tokens":5, "temperature":0}).encode()
+    url = LITELLM_BASE_URL.rstrip("/") + "/v1/chat/completions"
+    req = urllib.request.Request(url, data=body,
+        headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=LITELLM_TIMEOUT_S) as r:
+            d = json.loads(r.read()); ms = int((time.time()-t0)*1000)
+            txt = (d["choices"][0]["message"].get("content") or "").strip()
+            return ("ok" if txt else "empty", ms, txt[:40])
+    except Exception as e:
+        return (f"fail:{type(e).__name__}", int((time.time()-t0)*1000), str(e)[:80])
 
 def cli_smoke(route):
     """Run the route's CLI in the worker via a single-shot docker exec. Path-native."""
@@ -92,7 +148,7 @@ def main(limit_cli=None, only=None):
         con.execute("ALTER TABLE routes ADD COLUMN last_health TEXT")
         con.execute("ALTER TABLE routes ADD COLUMN last_health_at TEXT")
         con.commit()
-    q = "SELECT route_id, model_id, healthcheck_type, healthcheck_target, access_path, cost_mode FROM routes WHERE enabled=1"
+    q = "SELECT route_id, model_id, tool, healthcheck_type, healthcheck_target, access_path, cost_mode FROM routes WHERE enabled=1"
     routes = [dict(r) for r in con.execute(q)]
     if only:
         routes = [r for r in routes if only in r["route_id"]]
@@ -101,7 +157,14 @@ def main(limit_cli=None, only=None):
     cli_done = 0
     for r in routes:
         ht = r["healthcheck_type"]
-        if ht == "cli-smoke":
+        # Path-native dispatch. A LiteLLM-backed route (spine:litellm) is probed
+        # via LiteLLM regardless of its healthcheck_type label, because its
+        # model_id is a LiteLLM alias, not an OpenRouter slug. cli-smoke routes
+        # run their own CLI; any remaining api-chat route (tool != litellm) keeps
+        # the legacy OpenRouter probe.
+        if r["tool"] == "litellm" or r["access_path"] == "litellm":
+            status, ms, sample = litellm_chat(r)
+        elif ht == "cli-smoke":
             if limit_cli is not None and cli_done >= limit_cli:
                 continue
             status, ms, sample = cli_smoke(r)
