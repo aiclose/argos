@@ -677,3 +677,33 @@ def route_v2(t: TaskRequest):
         "candidate_count": plan.candidate_count,
         "rationale": plan.rationale,
     }
+
+
+# ==================== Sprint 3 (CHG-P9-050): classify-and-route + outcome ingest ====================
+# Thin FastAPI wrappers over sprint3_endpoints (fastapi-free core, unit-testable).
+# Lets the langgraph-spine (a) hand Argos raw task text and get a route back (the
+# spine has no task_class at its injection point), and (b) feed realised outcomes
+# back so the learning loop closes.
+import sprint3_endpoints as _s3
+
+
+class ClassifyRouteRequest(BaseModel):
+    task_text: str = Field(..., description="Raw task text to classify + route")
+    tag: str = Field(..., description="Unique tag for this task")
+    error_sensitivity: Optional[str] = Field(None, description="low/medium/high/critical (default medium)")
+    predicates: Optional[Dict[str, bool]] = Field(None, description="Backend-gate predicates supplied by caller")
+
+
+@app.post("/classify-and-route")
+def classify_and_route_endpoint(req: ClassifyRouteRequest):
+    """Classify raw task_text into the 25-class taxonomy, then route it. Returns the
+    RoutePlan (route_id/model_id/effective_cost/quality_floor/cleared_floor/fallbacks)
+    plus the derived task_class. A logical no-route is a 200 with an `error` field
+    (mirroring /route-v2); classification/infra failures get a non-500 status."""
+    body, code = _s3.classify_and_route(
+        task_text=req.task_text, tag=req.tag,
+        error_sensitivity=req.error_sensitivity, predicates=req.predicates)
+    if code >= 400:
+        raise HTTPException(code, detail=body.get("error") or body)
+    log(f"CLASSIFY-ROUTE {req.tag} -> class={body.get('task_class')} route={body.get('route_id')}")
+    return body
