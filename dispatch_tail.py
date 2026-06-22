@@ -3,7 +3,7 @@
 For each NEW cost_log entry since last run:
   1. Classify via Haiku (LiteLLM) into 24 task class taxonomy
   2. Insert into argos.db.dispatches with task_class
-  3. Call argos /route to get shadow recommendation
+  3. Call argos /route-v2 to get the shadow recommendation (route-aware)
   4. Compute shadow_vs_actual cost delta
   5. Log to predictions table (linked to dispatch_id)
 
@@ -32,7 +32,10 @@ COST_LOG_REMOTE_USER = "andy@192.168.4.10"
 COST_LOG_REMOTE_PATH = "/home/andy/orchestrator/cost-log.db"
 COST_LOG_LOCAL_SNAPSHOT = "/tmp/cost_log_snapshot.db"
 LITELLM_URL = "http://192.168.4.10:4000/v1/chat/completions"
-ARGOS_URL = "http://127.0.0.1:3020/route"
+# ARGOS-S2 FIX 2a: point at the REAL router endpoint. There is NO /route endpoint
+# (router.py exposes only /route-v2); the old bare /route was a dead URL, so every
+# shadow-recommendation call errored out and NO daily evidence was logged.
+ARGOS_URL = "http://127.0.0.1:3020/route-v2"
 LOG_PATH = "/home/andy/logs/argos-dispatch-tail.log"
 STATE_FILE = "/home/andy/argos/dispatch-tail-state.json"
 
@@ -148,6 +151,7 @@ Example: ["devops", "testing", ...]
         return None, None
 
 def call_argos_route(tag, task_class):
+    # Payload already matches TaskRequest, which /route-v2 also consumes - keep as-is.
     body = json.dumps({
         "tag": tag,
         "task_class": task_class,
@@ -166,6 +170,58 @@ def call_argos_route(tag, task_class):
     except Exception as e:
         log(f"  argos route error: {e}")
         return None
+
+def insert_prediction(db, dispatch_id, decision):
+    """Map a /route-v2 response into a predictions row linked to the real dispatch_id.
+
+    Honest mapping note (ARGOS-S2 2a): /route-v2 is route_select.select_route's
+    route-aware plan, NOT the legacy /route RoutingDecision. The live response
+    field names differ, so we map the REAL ones:
+        selected_model_id      <- selected_model (fallback: selected_route)
+        predicted_cost_p50     <- effective_cost_usd  (p90/p95 left NULL: not provided)
+        predicted_success_prob <- predicted_success
+        predicted_quality      <- quality_floor
+        fallback_chain         <- json(fallback_chain)
+        decision_rationale     <- rationale
+        predictor_version       = "route-v2-cost-optimised" (+"-noroute" if no route)
+
+    If /route-v2 returned an error or an empty selected_model we still insert a
+    row (predictor_version suffixed "-noroute", rationale carrying the reason) so
+    the absence of a route is itself recorded evidence. Best-effort: logs and
+    returns False on any DB error, never raises into the tail loop.
+    """
+    err = decision.get("error")
+    sel_model = decision.get("selected_model") or decision.get("selected_route")
+    cost = decision.get("effective_cost_usd")
+    psucc = decision.get("predicted_success")
+    quality = decision.get("quality_floor")
+    rationale = decision.get("rationale") or ""
+    fallbacks = decision.get("fallback_chain") or []
+    no_route = bool(err) or not sel_model
+    version = "route-v2-cost-optimised" + ("-noroute" if no_route else "")
+    if no_route:
+        reason = json.dumps(err) if err else "empty selected_model"
+        rationale = f"NO ROUTE ({reason})" + (f" | {rationale}" if rationale else "")
+        sel_model = None
+    try:
+        # Same column set the router's own log_prediction uses (proven against the
+        # live predictions schema); p90/p95/created_at default at the DB layer.
+        db.execute("""
+            INSERT INTO predictions
+            (dispatch_id, predictor_version, predicted_cost_p50, predicted_quality,
+             predicted_success_prob, candidate_models, selected_model_id,
+             fallback_chain, decision_rationale, was_exploration)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """, (
+            dispatch_id, version, cost, quality, psucc,
+            json.dumps([sel_model] if sel_model else []),
+            sel_model, json.dumps(fallbacks), rationale,
+        ))
+        db.commit()
+        return True
+    except Exception as e:
+        log(f"  prediction insert error for {dispatch_id}: {e}")
+        return False
 
 def main():
     log("=== argos dispatch tail start ===")
@@ -251,15 +307,22 @@ def main():
                     )
             db.commit()  # release lock before /route call
 
-            # Call argos /route to get shadow recommendation
+            # Call argos /route-v2 to get the shadow recommendation, then log the
+            # prediction row linked to THIS dispatch_id (the honest daily evidence).
             decision = call_argos_route(item['tag'], klass)
             if decision:
-                # Compute shadow vs actual cost delta
-                predicted = decision.get('predicted_cost_usd', 0)
-                actual = item.get('cost_usd', 0) or 0
-                delta = (actual - predicted) if predicted else 0
-                inserted_predictions += 1
-                log(f"  #{item['id']} tag={item['tag'][:30]:30} class={klass:20} predicted=${predicted:.5f} actual=${actual:.5f} delta=${delta:+.5f}")
+                logged = insert_prediction(db, dispatch_id, decision)
+                if logged:
+                    inserted_predictions += 1
+                sel_model = decision.get('selected_model') or decision.get('selected_route')
+                if decision.get('error') or not sel_model:
+                    log(f"  #{item['id']} tag={item['tag'][:30]:30} class={klass:20} (route-v2 no route: {decision.get('error')})")
+                else:
+                    # Compute shadow vs actual cost delta (effective_cost is the route-aware shadow price)
+                    predicted = decision.get('effective_cost_usd') or 0
+                    actual = item.get('cost_usd', 0) or 0
+                    delta = (actual - predicted) if predicted else 0
+                    log(f"  #{item['id']} tag={item['tag'][:30]:30} class={klass:20} model={str(sel_model)[:24]:24} predicted=${predicted:.5f} actual=${actual:.5f} delta=${delta:+.5f}")
             else:
                 log(f"  #{item['id']} tag={item['tag'][:30]:30} class={klass:20} (route call failed)")
 
@@ -276,7 +339,7 @@ def main():
     log(f"=== summary ===")
     log(f"  new cost_log entries: {len(new_entries)}")
     log(f"  inserted into dispatches: {inserted_dispatches}")
-    log(f"  argos /route calls: {inserted_predictions}")
+    log(f"  predictions logged (/route-v2): {inserted_predictions}")
     log(f"  classification failures: {classification_failures}")
     log(f"  last_processed_id: {last_seen_id}")
     log("=== argos dispatch tail done ===")
