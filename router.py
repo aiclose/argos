@@ -694,6 +694,16 @@ class ClassifyRouteRequest(BaseModel):
     predicates: Optional[Dict[str, bool]] = Field(None, description="Backend-gate predicates supplied by caller")
 
 
+class OutcomeRequest(BaseModel):
+    tag: str = Field(..., description="Idempotency key (stored as dispatch_id)")
+    task_class: Optional[str] = None
+    route_id: Optional[str] = None
+    model_id: Optional[str] = None
+    cost_usd: Optional[float] = None
+    status: Optional[str] = None
+    latency_ms: Optional[int] = None
+
+
 @app.post("/classify-and-route")
 def classify_and_route_endpoint(req: ClassifyRouteRequest):
     """Classify raw task_text into the 25-class taxonomy, then route it. Returns the
@@ -706,4 +716,16 @@ def classify_and_route_endpoint(req: ClassifyRouteRequest):
     if code >= 400:
         raise HTTPException(code, detail=body.get("error") or body)
     log(f"CLASSIFY-ROUTE {req.tag} -> class={body.get('task_class')} route={body.get('route_id')}")
+    return body
+
+
+@app.post("/outcome")
+@app.post("/dispatch-result")
+def outcome_endpoint(req: OutcomeRequest):
+    """Ingest a realised outcome. Idempotent UPSERT keyed on tag; `accepted` derived
+    from `status` via outcome_labeler.status_to_label; never clobbers a judged row."""
+    body, code = _s3.record_outcome(req.dict())
+    if code >= 400:
+        raise HTTPException(code, detail=body.get("error") or body)
+    log(f"OUTCOME {req.tag} -> {body.get('action')} accepted={body.get('accepted')}")
     return body

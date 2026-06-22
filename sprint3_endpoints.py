@@ -152,3 +152,99 @@ def classify_and_route(task_text, tag, error_sensitivity=None, predicates=None,
     body["shadow_mode"] = True
     body["ok"] = plan.error is None
     return (body, 200)
+
+
+def record_outcome(payload, db_path=DB_PATH):
+    """Idempotent UPSERT of a realised outcome into dispatches. Returns (body, code).
+
+    Keyed on `tag` (stored AS dispatch_id - see SCHEMA NOTE). `accepted` is derived
+    from `status` via outcome_labeler.status_to_label (the source of truth). Updates
+    are COALESCE-safe: a None in the payload never null-clobbers an already-populated
+    column. A row that already carries a judge's quality_score is NEVER overwritten on
+    accepted/quality_score - cost/status/latency may still be refreshed.
+    """
+    tag = (payload.get("tag") or "").strip()
+    if not tag:
+        return ({"ok": False, "error": {
+            "code": "missing_tag",
+            "message": "tag is required (idempotency key)"}}, 400)
+
+    status = payload.get("status")
+    task_class = payload.get("task_class")
+    cost_usd = payload.get("cost_usd")
+    latency_ms = payload.get("latency_ms")
+    model_id = payload.get("model_id")
+    route_id = payload.get("route_id")
+
+    # Source of truth: never reinvent accepted-from-status. (None, _) for
+    # rejected_zdr / unknown statuses -> we leave accepted untouched.
+    if status is not None:
+        accepted, _base = outcome_labeler.status_to_label(status)
+    else:
+        accepted = None
+
+    try:
+        with sqlite3.connect(db_path, timeout=30) as db:
+            db.execute("PRAGMA busy_timeout=30000")
+            db.row_factory = sqlite3.Row
+
+            # Resolve route_id -> model_used (dispatches has no route_id column).
+            model_used = model_id
+            if not model_used and route_id:
+                r = db.execute(
+                    "SELECT model_id FROM routes WHERE route_id=? "
+                    "ORDER BY enabled DESC LIMIT 1", (route_id,)).fetchone()
+                if r:
+                    model_used = r["model_id"]
+
+            existing = db.execute(
+                "SELECT dispatch_id, quality_score, accepted, status "
+                "FROM dispatches WHERE dispatch_id=?", (tag,)).fetchone()
+
+            if existing is None:
+                db.execute(
+                    "INSERT INTO dispatches "
+                    "(dispatch_id, ts, source, model_used, task_class, "
+                    " actual_cost_usd, latency_ms, status, accepted) "
+                    "VALUES (?, ?, 'spine_outcome', ?, ?, ?, ?, ?, ?)",
+                    (tag, _utcnow(), model_used, task_class,
+                     cost_usd, latency_ms, status, accepted))
+                db.commit()
+                return ({"ok": True, "action": "insert", "dispatch_id": tag,
+                         "accepted": accepted, "model_used": model_used,
+                         "task_class": task_class, "status": status}, 200)
+
+            judged = existing["quality_score"] is not None
+            if judged:
+                # Preserve the judge's verdict; only refresh observational fields.
+                db.execute(
+                    "UPDATE dispatches SET "
+                    "  actual_cost_usd = COALESCE(?, actual_cost_usd), "
+                    "  latency_ms      = COALESCE(?, latency_ms), "
+                    "  status          = COALESCE(?, status), "
+                    "  model_used      = COALESCE(?, model_used), "
+                    "  task_class      = COALESCE(?, task_class) "
+                    "WHERE dispatch_id=?",
+                    (cost_usd, latency_ms, status, model_used, task_class, tag))
+                db.commit()
+                return ({"ok": True, "action": "update_preserve_judged",
+                         "dispatch_id": tag, "judged": True,
+                         "accepted": existing["accepted"]}, 200)
+
+            db.execute(
+                "UPDATE dispatches SET "
+                "  actual_cost_usd = COALESCE(?, actual_cost_usd), "
+                "  latency_ms      = COALESCE(?, latency_ms), "
+                "  status          = COALESCE(?, status), "
+                "  model_used      = COALESCE(?, model_used), "
+                "  task_class      = COALESCE(?, task_class), "
+                "  accepted        = COALESCE(?, accepted) "
+                "WHERE dispatch_id=?",
+                (cost_usd, latency_ms, status, model_used, task_class, accepted, tag))
+            db.commit()
+            eff_accepted = accepted if accepted is not None else existing["accepted"]
+            return ({"ok": True, "action": "update", "dispatch_id": tag,
+                     "accepted": eff_accepted, "judged": False}, 200)
+    except Exception as e:
+        return ({"ok": False, "error": {
+            "code": "outcome_write_failed", "message": str(e)}}, 500)
