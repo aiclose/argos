@@ -13,6 +13,13 @@ req=urllib.request.Request("https://openrouter.ai/api/v1/models",
 models=json.loads(urllib.request.urlopen(req, timeout=60).read())["data"]
 log(f"fetched {len(models)} models")
 
+# CHG-P9-050: notional daily-requests ration for the flat-rate Max OAuth codex
+# bucket. There is NO real cap to pull (flat-rate subscription), so codex-oauth's
+# quota_caps row would otherwise stay all-NULL and the bucket shadow price would
+# never ramp - the replay phantom. This gives it a tunable notional cap so codex
+# is ~free until it nears a sustainable daily volume, then spills. One-line tunable.
+CODEX_NOTIONAL_DAILY_REQUESTS = 200
+
 c=sqlite3.connect(DB)
 upd=0
 for m in models:
@@ -56,6 +63,19 @@ for bucket,info in bucket_free_limits.items():
     c.execute("UPDATE quota_caps SET daily_requests_cap=?, source=?, updated_at=? WHERE bucket=?",
               (FREE_REQ_BUDGET, f"daily-pull: {info['models']} free models, OR shared free budget", now, bucket))
     log(f"bucket {bucket}: {info['models']} free models, cap {FREE_REQ_BUDGET} req/day")
+
+# 3. maintain the codex-oauth notional ration so a pull never resets it to NULL.
+# INSERT-or-UPDATE (row currently exists, but stay robust if it is ever absent).
+# Touches ONLY codex-oauth - claude-oauth (retired) and deepseek-direct are left as is.
+CODEX_SOURCE = "notional Max-OAuth rationing cap (no real cap; tunable)"
+cur = c.execute(
+    "UPDATE quota_caps SET daily_requests_cap=?, source=?, updated_at=? WHERE bucket='codex-oauth'",
+    (CODEX_NOTIONAL_DAILY_REQUESTS, CODEX_SOURCE, now))
+if cur.rowcount == 0:
+    c.execute(
+        "INSERT INTO quota_caps(bucket, daily_requests_cap, source, updated_at) VALUES('codex-oauth',?,?,?)",
+        (CODEX_NOTIONAL_DAILY_REQUESTS, CODEX_SOURCE, now))
+log(f"bucket codex-oauth: notional cap {CODEX_NOTIONAL_DAILY_REQUESTS} req/day (no real cap; flat-rate Max OAuth)")
 
 c.commit()
 log("done")
