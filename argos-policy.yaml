@@ -119,3 +119,32 @@ quality_floors:
   medium: 0.70
   high: 0.85
   critical: 0.90
+
+# ---------------------------------------------------------------------------
+# DUAL-GATE (CHG-P9-052). The route gate has TWO predicates:
+#   clears_accept  = predicted_success >= task_classes.default_quality_floor
+#                    (the floor is now read on the ACCEPT-RATE scale; recalibrated
+#                    by the CHG-P9-052 floor migration -- e.g. devops 0.90 -> 0.80).
+#   clears_quality = (gate_mode == basic) OR benchmark_quality(model,class) >= q_min
+# clears = clears_accept AND clears_quality. accept_floor is IDENTICAL in both
+# modes; switching mode toggles ONLY whether clears_quality is applied. Never tune
+# accept_floor to compensate for strict. The gate produces the ELIGIBLE set; the
+# cost scorer above picks among whatever clears -- q_min is NOT in the cost weights.
+#
+# Env ARGOS_GATE_MODE (basic|strict) overrides gate_mode without editing this file.
+# Default strict: `accepted` currently only means "completed without error", so the
+# quality screen is load-bearing (catches completed-but-sloppy) until the agentic
+# vetter writes real quality labels; until then strict screens on bench_cache.
+gate_mode: strict        # "basic" | "strict"
+
+# q_min: LOOSE benchmark-quality screen (benchmark-SCORE scale, NOT accept-rate),
+# applied ONLY in strict mode. Looked up by class_id first, then error-sensitivity.
+# Screens out only genuinely-bad models (e.g. analysis mimo-v2.5 ~0.50, devops
+# nemotron ~0.68); it MUST NOT block the strong 0.85+ cluster. A model with NO
+# benchmark for its class is NOT blocked here (clears_quality treated TRUE) -- the
+# accept gate still governs cold-start models.
+q_min:
+  low: 0.55
+  medium: 0.60
+  high: 0.70
+  critical: 0.75
