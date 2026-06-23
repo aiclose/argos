@@ -48,6 +48,19 @@ BACKEND_GATE_REASONS = {
 }
 SOFT_EXEC_FLAVOURED_VERBS = {"build", "fix", "refactor", "test"}
 
+# CHG-P9-052 dual-gate. The route gate has two predicates (see select_route):
+#   clears_accept  = predicted_success >= accept_floor  (task_classes floor, now on
+#                    the ACCEPT-RATE scale; recalibrated by the floor migration).
+#   clears_quality = (gate_mode == basic) OR benchmark_quality >= q_min  (strict only).
+# accept_floor is IDENTICAL in both modes; mode toggles ONLY clears_quality.
+GATE_MODES = {"basic", "strict"}
+DEFAULT_GATE_MODE = "strict"
+GATE_MODE_ENV = "ARGOS_GATE_MODE"
+# Canonical bake-off judge for benchmark_quality lookups. Mirrors
+# weekly_eval_sprt.JUDGE_MODEL -- a bench_cache score is only comparable within one
+# judge (U5), so the quality screen reads exactly this judge's scores.
+CANONICAL_JUDGE = "google/gemini-2.5-flash"
+
 logger = logging.getLogger(__name__)
 
 
@@ -247,6 +260,22 @@ def _validate_policy(policy: dict, path: str) -> None:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"policy.quality_floors.{sensitivity} must be numeric") from exc
 
+    # CHG-P9-052 dual-gate config. Both keys are OPTIONAL (gate_mode defaults to
+    # strict, q_min defaults to no screen) so policies predating this sprint still
+    # load; when present they must be well-formed.
+    gate_mode = policy.get("gate_mode")
+    if gate_mode is not None and str(gate_mode).strip().lower() not in GATE_MODES:
+        raise ValueError("policy.gate_mode must be 'basic' or 'strict'")
+    q_min = policy.get("q_min")
+    if q_min is not None:
+        if not isinstance(q_min, Mapping):
+            raise ValueError("policy.q_min must be a mapping")
+        for key, value in q_min.items():
+            try:
+                float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"policy.q_min.{key} must be numeric") from exc
+
 
 def _load_policy(path: str = POLICY_PATH) -> dict:
     try:
@@ -373,6 +402,96 @@ def _quality_floor(con, task: RouteTask) -> float:
     # error-sensitivity fallback
     return {"low": 0.65, "medium": 0.70, "high": 0.85, "critical": 0.90}.get(
         task.error_sensitivity or "medium", 0.70)
+
+
+def _gate_mode(policy: Mapping) -> str:
+    """Resolved gate mode: env ARGOS_GATE_MODE wins, then policy.gate_mode, then
+    the default (strict). One switch, env-overridable without editing the policy."""
+    env = os.environ.get(GATE_MODE_ENV)
+    if env:
+        mode = env.strip().lower()
+        if mode in GATE_MODES:
+            return mode
+        logger.warning("ignoring invalid %s=%r (expected basic|strict)", GATE_MODE_ENV, env)
+    mode = str(policy.get("gate_mode", DEFAULT_GATE_MODE)).strip().lower()
+    return mode if mode in GATE_MODES else DEFAULT_GATE_MODE
+
+
+def _effective_sensitivity(con, task: RouteTask) -> str:
+    """Error-sensitivity to screen by: the task's own, else the class default, else
+    medium. Used only to pick a q_min row; the accept_floor path is separate."""
+    if task.error_sensitivity:
+        return str(task.error_sensitivity).lower()
+    if task.task_class:
+        row = con.execute(
+            "SELECT default_error_sensitivity FROM task_classes WHERE class_id=?",
+            (task.task_class,)).fetchone()
+        if row and row[0]:
+            return str(row[0]).lower()
+    return "medium"
+
+
+def _q_min_for(policy: Mapping, task: RouteTask, sensitivity: str) -> float:
+    """LOOSE benchmark-quality threshold for this task (strict mode only). Looked up
+    by class_id first, then error-sensitivity. 0.0 (no screen) when q_min is absent."""
+    q_min = policy.get("q_min", {}) or {}
+    if not isinstance(q_min, Mapping):
+        return 0.0
+    if task.task_class and task.task_class in q_min:
+        return float(q_min[task.task_class])
+    if sensitivity in q_min:
+        return float(q_min[sensitivity])
+    return 0.0
+
+
+def _benchmark_quality(con, model_id: Optional[str], task_class: Optional[str],
+                       judge_model: str = CANONICAL_JUDGE) -> Optional[float]:
+    """Mean bake-off benchmark SCORE for model_id on task_class from bench_cache,
+    using the canonical judge. task_id is '<task_class>/<slug>', so we match the
+    class prefix. Returns None when no benchmark exists (cold-start model, or class
+    never benched) -- the caller treats None as 'do not block on quality'.
+
+    Best-effort: a missing bench_cache table or any read error returns None rather
+    than raising; the quality screen is a sanity gate, not a correctness dependency.
+    """
+    if not model_id or not task_class:
+        return None
+    try:
+        row = con.execute(
+            "SELECT AVG(score) FROM bench_cache "
+            "WHERE model_id=? AND task_id LIKE ? AND judge_model=? AND score IS NOT NULL",
+            (model_id, f"{task_class}/%", judge_model)).fetchone()
+    except sqlite3.Error:
+        return None
+    if row and row[0] is not None:
+        return float(row[0])
+    return None
+
+
+def evaluate_gate(psucc: float, accept_floor: float, gate_mode: str,
+                  benchmark_quality: Optional[float], q_min: float) -> dict:
+    """Pure two-predicate gate. The ONLY place clears is decided.
+
+    - clears_accept  = psucc >= accept_floor. accept_floor is the (recalibrated)
+      task_classes floor, read on the ACCEPT-RATE scale -- NEVER a quality-score.
+      Identical in both modes.
+    - clears_quality = True in basic mode; in strict mode it is True when there is
+      NO benchmark (benchmark_quality is None -> don't block cold-start models) OR
+      the benchmark clears the LOOSE q_min screen.
+    - clears = clears_accept AND clears_quality.
+
+    No cost input by construction -- the gate is decoupled from the cost selector.
+    """
+    clears_accept = psucc >= accept_floor
+    if gate_mode == "basic":
+        clears_quality = True
+    else:
+        clears_quality = (benchmark_quality is None) or (benchmark_quality >= q_min)
+    return {
+        "clears_accept": clears_accept,
+        "clears_quality": clears_quality,
+        "clears": clears_accept and clears_quality,
+    }
 
 
 def _route_columns(con) -> set[str]:
@@ -544,7 +663,10 @@ def select_route(task: RouteTask) -> RoutePlan:
             prompt=task.prompt,
             policy=policy,
         )
-        floor = _quality_floor(con, task)
+        floor = _quality_floor(con, task)  # accept_floor: SAME in both gate modes
+        gate_mode = _gate_mode(policy)
+        sensitivity = _effective_sensitivity(con, task)
+        q_min = _q_min_for(policy, task, sensitivity)
         route_cols = _route_columns(con)
         optional = [
             col for col in (
@@ -583,10 +705,17 @@ def select_route(task: RouteTask) -> RoutePlan:
                 continue
             eff = costmod.effective_cost(r["route_id"], ctask, con)
             psucc, prior_note = _predicted_success(con, r, task, floor)
+            # Dual-gate: accept predicate (accept_floor, both modes) AND quality
+            # predicate (strict only). Decided here, BEFORE cost scoring -- the
+            # eligible set is independent of cost.
+            bq = _benchmark_quality(con, r["model_id"], task.task_class) if gate_mode != "basic" else None
+            gate_eval = evaluate_gate(psucc, floor, gate_mode, bq, q_min)
             candidates.append({
                 "route_id": r["route_id"], "model_id": r["model_id"],
                 "cost_mode": r["cost_mode"], "eff": eff,
-                "psucc": psucc, "prior_note": prior_note, "clears": psucc >= floor,
+                "psucc": psucc, "prior_note": prior_note, "clears": gate_eval["clears"],
+                "clears_accept": gate_eval["clears_accept"], "clears_quality": gate_eval["clears_quality"],
+                "benchmark_quality": bq,
                 "quota_score": _quota_score(con, r),
                 "path_preference": _path_preference(policy, r["cost_mode"]),
                 "latency": _latency_value(r, route_cols),
@@ -631,12 +760,17 @@ def select_route(task: RouteTask) -> RoutePlan:
 
         if not best["clears"]:
             err = {"code": "quality_floor_not_met", "message": "no route cleared quality floor"}
+            fail = ("accept" if not best["clears_accept"]
+                    else "quality" if not best["clears_quality"] else "both")
+            bq = best.get("benchmark_quality")
             rationale = (
-                f"backend={gate.backend} reason={gate.reason} | floor={floor:.2f} | "
+                f"backend={gate.backend} reason={gate.reason} | gate_mode={gate_mode} | "
+                f"accept_floor={floor:.2f} q_min={q_min:.2f} | "
                 f"strategy=within-backend-weighted-argmax | "
                 f"health_key=path-native(cli-smoke|api-chat),last_health:ok | "
                 f"candidates={len(candidates)} excluded={excluded} | "
-                f"best={best['route_id']} score={best['score']:.3f} psucc={best['psucc']:.2f} floor_fail"
+                f"best={best['route_id']} score={best['score']:.3f} psucc={best['psucc']:.2f} "
+                f"bench_q={bq if bq is None else round(bq, 2)} floor_fail={fail}"
             )
             return RoutePlan(None, None, None, round(best["eff"], 6), floor,
                              round(best["psucc"], 3), False, fallbacks,
@@ -645,7 +779,8 @@ def select_route(task: RouteTask) -> RoutePlan:
 
         rationale = (
             f"backend={gate.backend} reason={gate.reason} | task_class={task.task_class} | "
-            f"floor={floor:.2f} | strategy=within-backend-weighted-argmax | "
+            f"gate_mode={gate_mode} accept_floor={floor:.2f} q_min={q_min:.2f} | "
+            f"strategy=within-backend-weighted-argmax | "
             f"weights={dict(weights)} | health_key=path-native(cli-smoke|api-chat),last_health:ok | "
             f"candidates={len(candidates)} excluded={excluded} | "
             f"picked {best['route_id']} score={best['score']:.3f} "
